@@ -37,7 +37,7 @@ I can help you:
 
 What would you like to explore?
 
----------------
+---
 
 # Query-2
 @genelab-local-cypher @spokeokn-cypher
@@ -74,7 +74,7 @@ Would you like me to:
 
 Let me know what you'd like to investigate!
 
----------------
+---
 
 # Query-3
 Describe the Assay node and its properties in @genelab-remote-cypher, and include an example for a ground control vs space flight comparison.
@@ -148,7 +148,7 @@ Here's a real example from study OSD-100 examining the effect of spaceflight on 
 
 This assay would have connections to MGene nodes representing genes that showed differential expression between the ground control and spaceflight conditions, allowing researchers to identify which genes are affected by spaceflight in eye tissue.
 
----------------
+---
 
 # Query-4
 Describe the MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG relationship and its properties in @genelab-remote-cypher, and include an example for a ground control vs. space flight comparison.

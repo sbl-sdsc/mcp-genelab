@@ -9,6 +9,4 @@ wheels/
 .DS_Store
 # Virtual environments
 .venv
-# exclude MCP configuration with credentials
-mcp.json
-
+.ipynb_checkpoints

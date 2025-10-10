@@ -7,13 +7,14 @@
 
 A Model Context Protocol (MCP) server that converts natural language queries into [Cypher](https://neo4j.com/product/cypher-graph-query-language) queries and executes them against the configured Neo4j endpoints. Customized tools provide seamless access to the NASA GeneLab Knowledge Graph, enabling AI-assisted analysis of spaceflight experiments and their biological effects. This server allows researchers to query differential gene expression and DNA methylation data from NASA's space biology experiments through natural language interactions with AI assistants like Claude.
 
-The GeneLab Knowledge Graph integrates data from NASA's [GeneLab Data Repository](https://genelab.nasa.gov/) with biomedical knowledge from the [SPOKE](https://spoke.ucsf.edu/) (Scalable Precision Medicine Open Knowledge Engine) knowledge graph. This integration connects spaceflight experimental results with comprehensive biological context including genes, proteins, anatomical structures, pathways, and diseases.
+The GeneLab Knowledge Graph with data from NASA's [GeneLab Data Repository](https://genelab.nasa.gov/), part of the NASA [Open Science Data Repository (OSDR)](https://science.nasa.gov/biological-physical/data/osdr/) can be integrated with biomedical knowledge from the [SPOKE](https://spoke.ucsf.edu/) (Scalable Precision Medicine Open Knowledge Engine) knowledge graph. This integration connects spaceflight experimental results with a comprehensive biological context including genes, proteins, anatomical structures, pathways, and diseases.
 
 This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.net/) (Prototype Open Knowledge Network).
 
 ## Features
 
-- **Natural Language Querying**: Ask questions about spaceflight experiments in plain English - no need to write complex graph queries
+- **Natural Language Querying**: Ask questions in plain English - no need to write complex graph queries
+- **NASA GeneLab Queries**: Ask questions about spaceflight experiments in the NASA GeneLab knowledge graph
 - **Differential Gene Expression Analysis**: Find genes that are upregulated or downregulated in spaceflight conditions compared to ground controls
 - **Multi-Organism Support**: Query data across multiple model organisms including mice, rats, and other species used in space research
 - **DNA Methylation Data**: Access epigenetic changes observed in spaceflight experiments
@@ -22,8 +23,6 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
 - **Federated Queries**: Combine data from GeneLab with other Neo4j knowledge graphs for comprehensive biomedical analysis
 - **Multiple Access Methods**: Use through Claude Desktop, VS Code with GitHub Copilot, or programmatically via the MCP protocol
 - **Pre-configured Endpoints**: Ready-to-use access to both local and remote Neo4j databases containing the GeneLab Knowledge Graph
-
-## Prerequisites
 
 ## Prerequisites
 
@@ -50,7 +49,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-> **Note**: Once `uv` is installed, the `uvx` command in the configuration below will automatically download and run the latest version from PyPI when needed.
+> **Note**: Once `uv` is installed, the `uvx` command in the configuration below will automatically download and run the latest version of the MCP server from PyPI when needed.
 
 ### Claude Desktop Setup
 
@@ -215,7 +214,7 @@ For example:
 ```
 @genelab-local-cypher
 ```
-See [response](docs/example.md#Query-1).
+See [response](docs/examples.md#Query-1).
 
 2. **Federated Queries Across Multiple Servers**
 
@@ -227,31 +226,31 @@ You can also perform federated queries across multiple MCP servers.
 
 This will execute the query across both servers and combine the results as applicable.
 
-See [response](docs/example.md#Query-2).
+See [response](docs/examples.md#Query-2).
 
 3. **Node Metadata**
 ```
 Describe the Assay node and its properties in @genelab-remote-cypher, and include an example for a ground control vs. space flight comparison.
 ```
-See [response](docs/example.md#Query-3).
+See [response](docs/examples.md#Query-3).
 
 4. **Relationship Metadata**
 ```
 Describe the MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG relationship and its properties in @genelab-remote-cypher, and include an example for a ground control vs. space flight comparison.
 ```
-See [response](docs/example.md#Query-4).
+See [response](docs/examples.md#Query-4).
 
 5. **High-level overview of the GeneLab KG**
 ```
 Give a breakdown of missions, studies, and the type of technologies used in the studies.
  ```
-See [response](docs/example.md#Query-5).
+See [response](docs/examples.md#Query-5).
 
 6. **Find upregulated genes in space flight:**
 ```
 Find the top 5 upregulated genes in mouse liver tissue during Space Flight.
 ```
-See [response](docs/example.md#Query-6).
+See [response](docs/examples.md#Query-6).
 
 ## Development
 
