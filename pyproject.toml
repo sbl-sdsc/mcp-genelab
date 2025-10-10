@@ -1,0 +1,35 @@
+[project]
+name = "mcp-genelab"
+version = "0.1.0"
+description = "MCP server for querying Neo4j Knowledge Graphs with custom tools for quering GeneLab"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+keywords = ["mcp", "NASA", "GeneLab", "OSDR", "proto-okn"]
+authors = [
+    { name = "Peter W Rose", email = "pwrose.ucsd@gmail.com" },
+]
+dependencies = [
+    "mcp>=1.6.0",
+    "neo4j>=5.26.0",
+    "pydantic>=2.10.1",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/sbl-sdsc/mcp-genelab"
+Repository = "https://github.com/sbl-sdsc/mcp-genelab"
+Issues = "https://github.com/sbl-sdsc/mcp-genelab/issues"
+
+[project.scripts]
+mcp-genelab = "mcp_genelab.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"] 

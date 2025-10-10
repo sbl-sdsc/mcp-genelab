@@ -1,0 +1,37 @@
+{
+  "mcpServers": {
+    "genelab-local-cypher": {
+      "command": "uvx",
+      "args": [
+        "--index-url",
+        "https://test.pypi.org/simple/",
+        "--extra-index-url",
+        "https://pypi.org/simple/",
+        "mcp-genelab"
+      ],
+      "env": {
+        "NEO4J_URI": "bolt://localhost:7687",
+        "NEO4J_USERNAME": "neo4j",
+        "NEO4J_PASSWORD": "neo4jdemo",
+        "NEO4J_DATABASE": "spoke-genelab-v0.0.4",
+        "INSTRUCTIONS": "Query the GeneLab KG for differential gene expression and DNA methylation data from NASA space flight experiments."
+      }
+    },
+    "genelab-remote-cypher": {
+      "command": "uvx",
+      "args": [
+        "--index-url",
+        "https://test.pypi.org/simple/",
+        "--extra-index-url",
+        "https://pypi.org/simple/",
+        "mcp-genelab"
+      ],
+      "env": {
+        "NEO4J_URI": "bolt://remote_url:7687",
+        "NEO4J_USERNAME": "username",
+        "NEO4J_PASSWORD": "password",
+        "NEO4J_DATABASE": "spoke-genelab-v0.0.4",
+        "INSTRUCTIONS": "Query the GeneLab KG for differential gene expression and DNA methylation data from NASA space flight experiments."
+      }
+    }
+}
