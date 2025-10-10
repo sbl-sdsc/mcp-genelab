@@ -5,11 +5,11 @@
 [![Model Context Protocol](https://img.shields.io/badge/MCP-Compatible-green.svg)](https://modelcontextprotocol.io/)
 [![PyPI version](https://badge.fury.io/py/mcp_proto_okn.svg)](https://badge.fury.io/py/mcp-genelab)
 
-A Model Context Protocol (MCP) server that converts natural language queries into [Cypher](https://neo4j.com/product/cypher-graph-query-language) queries and executes them against the configured Neo4j endpoints. Customized tools provide seamless access to the NASA GeneLab Knowledge Graph, enabling AI-assisted analysis of spaceflight experiments and their biological effects. This server allows researchers to query differential gene expression and DNA methylation data from NASA's space biology experiments through natural language interactions with AI assistants like Claude.
+A Model Context Protocol (MCP) server that converts natural language queries into [Cypher](https://neo4j.com/product/cypher-graph-query-language) queries and executes them against the configured Neo4j endpoints. Customized tools provide seamless access to the NASA [GeneLab Knowledge Graph](https://github.com/BaranziniLab/spoke_genelab), enabling AI-assisted analysis of spaceflight experiments and their biological effects. This server allows researchers to query differential gene expression and DNA methylation data from NASA's space biology experiments through natural language interactions with AI assistants like Claude.
 
-The GeneLab Knowledge Graph with data from NASA's [GeneLab Data Repository](https://genelab.nasa.gov/), part of the NASA [Open Science Data Repository (OSDR)](https://science.nasa.gov/biological-physical/data/osdr/) can be integrated with biomedical knowledge from the [SPOKE](https://spoke.ucsf.edu/) (Scalable Precision Medicine Open Knowledge Engine) knowledge graph. This integration connects spaceflight experimental results with a comprehensive biological context including genes, proteins, anatomical structures, pathways, and diseases.
+The GeneLab Knowledge Graph with data from NASA's [GeneLab Data Repository](https://genelab.nasa.gov/), part of the NASA [Open Science Data Repository (OSDR)](https://science.nasa.gov/biological-physical/data/osdr/), can be integrated with biomedical knowledge from the [SPOKE](https://spoke.ucsf.edu/) (Scalable Precision Medicine Open Knowledge Engine) knowledge graph. This integration connects spaceflight experimental results with a comprehensive biological context, including genes, proteins, anatomical structures, pathways, and diseases.
 
-This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.net/) (Prototype Open Knowledge Network).
+This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.net/) (Prototype Open Knowledge Network). It's an extension of the [Neo4j Cypher MCP server](https://github.com/neo4j-contrib/mcp-neo4j/tree/main/servers/mcp-neo4j-cypher).
 
 ## Features
 
@@ -32,6 +32,9 @@ Before installing the MCP Server Proto-OKN, ensure you have:
 - **Client Application**: One of the following:
   - Claude Desktop with Pro or Max subscription
   - VS Code Insiders with GitHub Copilot subscription
+- **Neo4j Knowledge Graphs**:
+  - For a local installation of the GeneLab KG see [setup](https://github.com/BaranziniLab/spoke_genelab)
+  - For remote access to GeneLab and SPOKE KGs [request](https://github.com/sbl-sdsc/mcp-genelab/issues) credentials
 
 ## Installation
 
@@ -97,36 +100,24 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
      "mcpServers": {
       "genelab-local-cypher": {
          "command": "uvx",
-         "args": [
-           "--index-url",
-           "https://test.pypi.org/simple/",
-           "--extra-index-url",
-           "https://pypi.org/simple/",
-           "mcp-genelab"
-         ],
+         "args": ["mcp-genelab"],
          "env": {
            "NEO4J_URI": "bolt://localhost:7687",
            "NEO4J_USERNAME": "neo4j",
            "NEO4J_PASSWORD": "neo4jdemo",
            "NEO4J_DATABASE": "spoke-genelab-v0.0.4",
-           "INSTRUCTIONS": "Query the GeneLab KG for differential gene expression and DNA methylation data from NASA space flight experiments."
+           "INSTRUCTIONS": "Query the GeneLab Knowledge Graph to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics) and DNA methylation (epigenomics) data."
          }
        },
        "genelab-remote-cypher": {
          "command": "uvx",
-         "args": [
-           "--index-url",
-           "https://test.pypi.org/simple/",
-           "--extra-index-url",
-           "https://pypi.org/simple/",
-           "mcp-genelab"
-         ],
+         "args": ["mcp-genelab"],
          "env": {
            "NEO4J_URI": "bolt://remote_url:7687",
            "NEO4J_USERNAME": "username",
            "NEO4J_PASSWORD": "password",
            "NEO4J_DATABASE": "spoke-genelab-v0.0.4",
-           "INSTRUCTIONS": "Query the GeneLab KG for differential gene expression and DNA methylation data from NASA space flight experiments."
+           "INSTRUCTIONS": "Query the GeneLab Knowledge Graph to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics) and DNA methylation (epigenomics) data."
          }
       }
    }
@@ -172,19 +163,13 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
      "servers": {
       "genelab-local-cypher": {
          "command": "uvx",
-         "args": [
-           "--index-url",
-           "https://test.pypi.org/simple/",
-           "--extra-index-url",
-           "https://pypi.org/simple/",
-           "mcp-genelab"
-         ],
+         "args": ["mcp-genelab"],
          "env": {
            "NEO4J_URI": "bolt://localhost:7687",
            "NEO4J_USERNAME": "neo4j",
            "NEO4J_PASSWORD": "neo4jdemo",
            "NEO4J_DATABASE": "spoke-genelab-v0.0.4",
-           "INSTRUCTIONS": "Query the GeneLab KG for differential gene expression and DNA methylation data from NASA space flight experiments."
+           "INSTRUCTIONS": "Query the GeneLab Knowledge Graph to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics) and DNA methylation (epigenomics) data."
          }
        }
    }
@@ -451,10 +436,11 @@ This work is supported by:
 ### Related Projects
 
 - [Proto-OKN Project](https://www.proto-okn.net/) - Prototype Open Knowledge Network initiative
-- [FRINK Platform](https://frink.renci.org/) - Knowledge graph hosting infrastructure  
-- [Knowledge Graph Registry](https://frink.renci.org/registry/) - Catalog of available knowledge graphs
+- [NASA Open Science Data Repository (OSDR)](https://science.nasa.gov/biological-physical/data/osdr/) - Repository of multi-modal space life science data
+- [NASA GeneLab Data Repository](https://genelab.nasa.gov/) - GeneLab data repository used to create the GeneLab KG
+- [NASA GeneLab KG](https://github.com/BaranziniLab/spoke_genelab) - Git Repository for creating the GeneLab KG
 - [Model Context Protocol](https://modelcontextprotocol.io/) - AI assistant integration standard
-- [Original MCP Server SPARQL](https://github.com/ekzhu/mcp-server-sparql/) - Base implementation reference
+- [Original Neo4j Cypher MCP server](https://github.com/neo4j-contrib/mcp-neo4j/tree/main/servers/mcp-neo4j-cypher) - Base implementation reference
 
 ---
 
