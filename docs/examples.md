@@ -40,14 +40,14 @@ What would you like to explore?
 ---
 
 # Query-2
-@genelab-local-cypher @spokeokn-cypher
+@genelab-remote-cypher @spokeokn-cypher
 # Model-2
 Sonnet 4.5
 # Response-2
 I have access to two Neo4j knowledge graph databases through Cypher query tools:
 
-## 1. **GeneLab Local Cypher** (genelab-local-cypher)
-This appears to be a local instance of NASA GeneLab data, which likely contains:
+## 1. **GeneLab Local Cypher** (genelab-remote-cypher)
+This appears to be a instance of NASA GeneLab data, which likely contains:
 - Space biology and genomics experimental data
 - Gene expression studies from spaceflight experiments
 - Relationships between genes, organisms, tissues, and experimental conditions
