@@ -262,7 +262,7 @@ uv version --bump minor
 uv build
 
 # Publish to TestPyPI first (recommended)
-uv publish --publish-url https://test.pypi.org/legacy --token pypi-YOUR_TEST_PYPI_TOKEN_HERE
+uv publish --publish-url https://test.pypi.org/legacy/ --token pypi-YOUR_TEST_PYPI_TOKEN_HERE
 
 # Test the deployment
 For testing, add the following parameters to the `args` option.
@@ -278,7 +278,8 @@ For testing, add the following parameters to the `args` option.
 uv publish --token pypi-YOUR_PYPI_TOKEN_HERE
 ```
 
-#--------------------
+---
+
 ## API Reference
 
 ### Available Tools
