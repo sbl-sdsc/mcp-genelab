@@ -206,7 +206,7 @@ See [response](docs/examples.md#Query-1).
 You can also perform federated queries across multiple MCP servers.
 
 ```
-@genelab-remote-cypher @spokeokn-cypher
+@genelab-remote-cypher @spokeokn-remote-cypher
 ```
 
 This will execute the query across both servers and combine the results as applicable.

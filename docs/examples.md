@@ -40,7 +40,7 @@ What would you like to explore?
 ---
 
 # Query-2
-@genelab-remote-cypher @spokeokn-cypher
+@genelab-remote-cypher @spokeokn-remote-cypher
 # Model-2
 Sonnet 4.5
 # Response-2
@@ -53,7 +53,7 @@ This appears to be a instance of NASA GeneLab data, which likely contains:
 - Relationships between genes, organisms, tissues, and experimental conditions
 - Tools to find upregulated/downregulated genes in space vs. ground conditions
 
-## 2. **SPOKE OKN Cypher** (spokeokn-cypher)
+## 2. **SPOKE OKN Cypher** (spokeokn-remote-cypher)
 SPOKE (Scalable Precision Medicine Open Knowledge Engine) is a biomedical knowledge graph that likely contains:
 - Biomedical entities and relationships
 - Drug-disease-gene associations
