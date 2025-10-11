@@ -16,8 +16,8 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
 - **Natural Language Querying**: Ask questions in plain English - no need to write complex graph queries
 - **NASA GeneLab Queries**: Ask questions about spaceflight experiments in the NASA GeneLab knowledge graph
 - **Differential Gene Expression Analysis**: Find genes that are upregulated or downregulated in spaceflight conditions compared to ground controls
-- **Multi-Organism Support**: Query data across multiple model organisms including mice, rats, and other species used in space research
 - **DNA Methylation Data**: Access epigenetic changes observed in spaceflight experiments
+- **Multi-Organism Support**: Query data across multiple model organisms including mice, rats, and other species used in space research
 - **Tissue-Specific Analysis**: Filter results by specific organs, tissues, or cell types
 - **Biomedical Context Integration**: Connect spaceflight gene expression changes to pathways, diseases, and other biological knowledge from SPOKE
 - **Federated Queries**: Combine data from GeneLab with other Neo4j knowledge graphs for comprehensive biomedical analysis
@@ -68,7 +68,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
    **Option A: Download Pre-configured File (Recommended)**
 
-   Download the pre-configured `claude_desktop_config.json` file with FRINK endpoints from the repository and copy it to the appropriate location:
+   Download the pre-configured `claude_desktop_config.json` file with Neo4j endpoints from the repository and copy it to the appropriate location:
 
    **macOS**:
    ```bash
