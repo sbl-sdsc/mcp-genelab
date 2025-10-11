@@ -159,9 +159,9 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
    Create or edit `.vscode/mcp.json` in your workspace:
 
    ```json
-     {
+   {
      "servers": {
-      "genelab-local-cypher": {
+       "genelab-local-cypher": {
          "command": "uvx",
          "args": ["mcp-genelab"],
          "env": {
@@ -172,6 +172,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
            "INSTRUCTIONS": "Query the GeneLab Knowledge Graph to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics) and DNA methylation (epigenomics) data."
          }
        }
+     }
    }
    ```
 
