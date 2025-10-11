@@ -3,7 +3,7 @@
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Model Context Protocol](https://img.shields.io/badge/MCP-Compatible-green.svg)](https://modelcontextprotocol.io/)
-[![PyPI version](https://badge.fury.io/py/mcp_proto_okn.svg)](https://badge.fury.io/py/mcp-genelab)
+[![PyPI version](https://badge.fury.io/py/mcp_genelab.svg)](https://badge.fury.io/py/mcp-genelab)
 
 A Model Context Protocol (MCP) server that converts natural language queries into [Cypher](https://neo4j.com/product/cypher-graph-query-language) queries and executes them against the configured Neo4j endpoints. Customized tools provide seamless access to the NASA [GeneLab Knowledge Graph](https://github.com/BaranziniLab/spoke_genelab), enabling AI-assisted analysis of spaceflight experiments and their biological effects. This server allows researchers to query differential gene expression and DNA methylation data from NASA's space biology experiments through natural language interactions with AI assistants like Claude.
 
