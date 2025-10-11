@@ -26,7 +26,7 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
 
 ## Prerequisites
 
-Before installing the MCP Server Proto-OKN, ensure you have:
+Before installing the MCP server, ensure you have:
 
 - **Operating System**: macOS, Linux, or Windows
 - **Client Application**: One of the following:
@@ -133,7 +133,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
    1. Launch Claude Desktop
    2. Navigate to `Claude->Settings->Connectors`
-   3. Verify that the configured Proto-OKN endpoints appear in the connector list
+   3. Verify that the configured Neo4j endpoints appear in the connector list
    4. You can configure each service to always ask for permission or to run it unsupervised (recommended)
 
 ### VS Code Setup
