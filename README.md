@@ -93,7 +93,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
    Alternatively, you can manually edit the configuration file in Claude Desktop. Navigate to `Claude->Settings->Developer->Edit Config`
    to edit it.
 
-   Below is an example of how to configure local and remote Neo4j endpoints.
+   Below is an example of how to configure local and remote Neo4j endpoints. For remotely hosted Neo4j servers, update the url, username, and password.
 
    ```json
    {
