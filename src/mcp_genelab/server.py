@@ -30,8 +30,8 @@ def _is_write_query(query: str) -> bool:
         is not None
     )
 
-def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", namespace: str = "", instructions: str = "") -> FastMCP:
-    mcp: FastMCP = FastMCP("mcp-neo4j-cypher", dependencies=["neo4j", "pydantic"], instructions=instructions)
+def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instructions: str = "") -> FastMCP:
+    mcp: FastMCP = FastMCP("mcp-genelab", dependencies=["neo4j", "pydantic"], instructions=instructions)
 
     async def get_neo4j_schema() -> list[types.TextContent]:
         """List all node, their attributes and their relationships to other nodes in the neo4j database.
