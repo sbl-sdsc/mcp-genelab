@@ -40,15 +40,30 @@ Before installing the MCP server, ensure you have:
 
 ### Prerequisites
 
-The MCP GeneLab server requires the `uv` package manager to be installed on your system. If you don't have it installed run:
+The MCP GeneLab server requires installing the `uv` package manager on your system. If you don't have it installed, run:
 
 ```bash
 # macOS/Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+Check if `uv` is in the PATH
+```bash
+which uv
 ```
+
+If `uv` is not found, add the following line to your `~/.zshrc` file for zsh or `/.bash_profile` for bash.
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then reload the shell.
+```bash
+source ~/.zshrc  # or source ~/.bash_profile
+```
+
 # Windows
+```powershell
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
