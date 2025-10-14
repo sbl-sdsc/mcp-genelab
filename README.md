@@ -73,7 +73,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
    **macOS**:
    ```bash
    # Download the config file
-   curl -o /tmp/claude_desktop_config.json https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/main/config/claude_desktop_config.json
+   curl -o /tmp/claude_desktop_config.json https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/claude_desktop_config.json
    
    # Copy to Claude Desktop configuration directory
    cp /tmp/claude_desktop_config.json "$HOME/Library/Application Support/Claude/"
@@ -82,7 +82,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
    **Windows PowerShell**:
    ```powershell
    # Download the config file
-   Invoke-WebRequest -Uri "https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/main/config/claude_desktop_config.json" -OutFile "$env:TEMP\claude_desktop_config.json"
+   Invoke-WebRequest -Uri "https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/claude_desktop_config.json" -OutFile "$env:TEMP\claude_desktop_config.json"
    
    # Copy to Claude Desktop configuration directory
    Copy-Item "$env:TEMP\claude_desktop_config.json" "$env:APPDATA\Claude\"
