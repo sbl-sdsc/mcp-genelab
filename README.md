@@ -62,6 +62,22 @@ Then reload the shell.
 source ~/.zshrc  # or source ~/.bash_profile
 ```
 
+If you are using `macOS 12`, you also need to install `realpath`.
+
+To check if you have `realpath` installed, run:
+```bash
+which realpath
+```
+
+Download the [Homebrew installer](https://github.com/Homebrew/brew/releases/download/4.6.17/Homebrew-4.6.17.pkg) and click on the downloaded package to install Homebrew.
+
+Then run the following command to install coreutils and check if `realpath` is available.
+```bash
+brew install coreutils
+which realpath
+```
+
+
 # Windows
 ```powershell
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
