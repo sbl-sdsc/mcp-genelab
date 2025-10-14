@@ -22,7 +22,7 @@
         "INSTRUCTIONS": "Query the GeneLab KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics) and DNA methylation (epigenomics) data."
       }
     },
-    "spokeokn-remote-cypher": {
+    "spoke-okn-remote-cypher": {
       "command": "uvx",
       "args": ["mcp-genelab"],
       "env": {
