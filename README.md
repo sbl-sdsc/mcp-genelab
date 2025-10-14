@@ -185,35 +185,27 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
    > **Requirements**: GitHub Copilot subscription is required for MCP integration.
 
-3. **Configure Workspace**
+3. **Configure MCP Server**
 
-   Create or edit `.vscode/mcp.json` in your workspace:
+   **Option A: Download Pre-configured File (Recommended)**
 
-   ```json
-   {
-     "servers": {
-       "genelab-local-cypher": {
-         "command": "uvx",
-         "args": ["mcp-genelab"],
-         "env": {
-           "NEO4J_URI": "bolt://localhost:7687",
-           "NEO4J_USERNAME": "neo4j",
-           "NEO4J_PASSWORD": "neo4jdemo",
-           "NEO4J_DATABASE": "spoke-genelab-v0.0.4",
-           "INSTRUCTIONS": "Query the GeneLab Knowledge Graph to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics) and DNA methylation (epigenomics) data."
-         }
-       }
-     }
-   }
+   Download the pre-configured `mcp.json` file from the repository and copy it to the appropriate location.
+
+   **macOS**:
+   ```bash
+   # Download the config file
+   curl -o /tmp/mcp.json https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/main/config/mcp.json
+
+   # Copy to VS Code Insiders configuration directory
+   cp /tmp/mcp.json "$HOME/Library/Application Support/Code - Insiders/User/mcp.json"
    ```
-
-   > **Note**: For the VS Code Insiders configuration, change  "mcpServers" to "servers".
+ > **Note**: VS Code Insiders mcp.json file is identical to the claude_desktop_config.json file, except "mcpServer" is replaced by "server".
 
 4. **Use the MCP Server**
 
    1. Open a new chat window in VS Code
    2. Select **Agent** mode
-   3. Choose **Claude Sonnet 4.5 or Opus 4.1 or later** model for optimal performance
+   3. Choose **Claude Sonnet 4.5 or later** model for optimal performance
    4. The MCP servers will automatically connect and provide knowledge graph access
 
 
