@@ -175,13 +175,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
     async def find_downregulated_genes(
+        study: str = Field(..., description="The study with the assay data (e.g., 'OSD-255')"),
         organism: str = Field(..., description="The organism to search for (e.g., 'Mus musculus')"),
         material: str = Field(..., description="The organ or organ/tissue/cell type to search for (e.g., 'liver')"),
         factor_space_1: str = Field("Ground Control", description="The first experimental grouping of samples using in the assay, indicating whether is was exposed to Space Flight or control conditions. (e.g., 'Ground Control')"),
         factor_space_2: str = Field("Space Flight", description="The second experimental grouping of samples using in the assay, indicating whether is was exposed to Space Flight or control conditions. (e.g., 'Space Flight')"),
         top_n: int = Field(100, description="Number of top downregulated genes to return")
     ) -> list[types.TextContent]:
-        """Find downregulated genes for an organism and a specific organ or tissue.
+        """Find downregulated genes for a specific study, organism, and specific organ or tissue.
         
         This tool finds genes that are downregulated for two experimental conditions
         for a specific organism and tissue/organ/cell type. It ensures that only experiments
@@ -193,7 +194,8 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                   --> (a:Assay)
                   -[m:MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG]-
                   (g:MGene)
-        WHERE s.organism = $organism
+        WHERE s.identifier = $study
+          AND s.organism = $organism
           AND a.factor_space_1  = $factor_space_1
           AND a.factor_space_2  = $factor_space_2
           AND a.material_name_1 = $material
@@ -224,6 +226,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         """
 
         params = {
+            "study": study,
             "organism": organism,
             "material": material,
             "factor_space_1": factor_space_1,
@@ -244,13 +247,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
     async def find_upregulated_genes(
+        study: str = Field(..., description="The study with the assay data (e.g., 'OSD-255')"),
         organism: str = Field(..., description="The organism to search for (e.g., 'Mus musculus')"),
         material: str = Field(..., description="The organ or organ/tissue/cell type to search for (e.g., 'liver')"),
         factor_space_1: str = Field("Ground Control", description="The first experimental grouping of samples using in the assay, indicating whether is was exposed to Space Flight or control conditions. (e.g., 'Ground Control')"),
         factor_space_2: str = Field("Space Flight", description="The second experimental grouping of samples using in the assay, indicating whether is was exposed to Space Flight or control conditions. (e.g., 'Space Flight')"),
         top_n: int = Field(100, description="Number of top upregulated genes to return")
     ) -> list[types.TextContent]:
-        """Find upregulated genes for an organism and a specific organ or tissue.
+        """Find upregulated genes for a specific study, organism, and specific organ or tissue.
         
         This tool finds genes that are upregulated for two experimental conditions
         for a specific organism and tissue/organ/cell type. It ensures that only experiments
@@ -262,7 +266,8 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                   --> (a:Assay)
                   -[m:MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG]-
                   (g:MGene)
-        WHERE s.organism = $organism
+        WHERE s.identifier = $study
+          AND s.organism = $organism
           AND a.factor_space_1  = $factor_space_1
           AND a.factor_space_2  = $factor_space_2
           AND a.material_name_1 = $material
@@ -293,6 +298,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         """
 
         params = {
+            "study": study,
             "organism": organism,
             "material": material,
             "factor_space_1": factor_space_1,
