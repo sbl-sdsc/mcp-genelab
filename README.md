@@ -7,7 +7,7 @@
 
 A Model Context Protocol (MCP) server that converts natural language queries into [Cypher](https://neo4j.com/product/cypher-graph-query-language) queries and executes them against the configured Neo4j endpoints. Customized tools provide seamless access to the NASA [GeneLab Knowledge Graph](https://github.com/BaranziniLab/spoke_genelab) (v0.3.1), enabling AI-assisted analysis of spaceflight experiments and their biological effects. This server allows researchers to query differential gene expression, DNA methylation, and differential organism abundance data from NASA's space biology experiments through natural language interactions with AI assistants like Claude.
 
-The GeneLab Knowledge Graph integrates data from NASA's [GeneLab Data Repository](https://genelab.nasa.gov/), part of the NASA [Open Science Data Repository (OSDR)](https://science.nasa.gov/biological-physical/data/osdr/), with biomedical knowledge from the [SPOKE](https://spoke.ucsf.edu/) (Scalable Precision Medicine Open Knowledge Engine) knowledge graph. This integration connects spaceflight experimental results with a comprehensive biological context, including genes, proteins, anatomical structures, pathways, and diseases.
+The GeneLab Knowledge Graph integrates omics data from NASA's [Open Science Data Repository (OSDR)](https://science.nasa.gov/biological-physical/data/osdr/), with nodes that can be used as connectors to other knowledge graphs, such as the [SPOKE](https://spoke.ucsf.edu/) (Scalable Precision Medicine Open Knowledge Engine) knowledge graph. This integration connects spaceflight experimental results with a comprehensive biological context, including genes, proteins, anatomical structures, pathways, and diseases.
 
 This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.net/) (Prototype Open Knowledge Network). It's an extension of the [Neo4j Cypher MCP server](https://github.com/neo4j-contrib/mcp-neo4j/tree/main/servers/mcp-neo4j-cypher).
 
@@ -40,9 +40,10 @@ The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types:
 - **Natural Language Querying**: Ask questions in plain English — no need to write complex graph queries
 - **NASA GeneLab Queries**: Ask questions about spaceflight experiments in the NASA GeneLab knowledge graph
 - **Differential Gene Expression Analysis**: Find genes that are upregulated or downregulated in spaceflight conditions compared to ground controls
-- **DNA Methylation Data**: Access epigenetic changes observed in spaceflight experiments
-- **Differential Organism Abundance**: Query amplicon/metagenomics data showing changes in microbial community composition during spaceflight
-- **Common DEG Analysis**: Find genes that are differentially expressed across multiple assays or studies
+- **DNA Methylation Data**: Access epigenetic changes observed in spaceflight experiments, including promoter / exon / intron / distance-to-feature filtering
+- **Differential Organism Abundance**: Query amplicon/metagenomics data showing changes in microbial community composition during spaceflight (DESeq2 and ANCOM-BC method-aware significance filtering)
+- **Cross-Assay Intersection Analyses**: Find features differentially detected across multiple assays — common DEGs, common DMRs, common DA organisms — each direction (up/down, hyper/hypo, increased/decreased) kept separate so the LLM can reason about them independently
+- **Expression-Methylation Coupling**: Identify differentially expressed genes whose promoter (or other gene region) is also differentially methylated in matched assays; supports pooled DM evidence across multiple methylation assays
 - **Multi-Organism Support**: Query data across multiple model organisms including mice, rats, and other species used in space research
 - **Anatomy & Cell Type Filtering**: Filter results by specific anatomical structures (UBERON ontology) or cell types (Cell Ontology) used in experiments
 - **Assay Selection**: Browse and filter assays by study, organism, technology, or measurement type
@@ -50,8 +51,9 @@ The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types:
 - **Federated Queries**: Combine data from GeneLab with other Neo4j knowledge graphs for comprehensive biomedical analysis
 
 ### Visualization
-- **Volcano Plots**: Generate volcano plots showing differentially expressed genes with significance thresholds
-- **Venn Diagrams**: Create Venn diagrams comparing differentially expressed genes across 2 or 3 assays
+- **Volcano Plots**: Generate volcano plots showing differentially expressed genes / methylated regions / abundant organisms with significance thresholds
+- **Venn Diagrams**: Create Venn diagrams comparing differentially expressed genes (or DMRs, or DA organisms) across 2 or 3 assays, including an `expression_methylation` 2×2 grid variant for paired transcriptomic-epigenomic comparisons
+- **Plot Resource Layer**: Every generated plot is exposed as an MCP resource under `plot://<filename>` and via a `fetch_plot` tool, so clients can retrieve PNG bytes through a separate request from the tool call that produced them. A failed fetch can be retried without re-running the analysis
 - **Schema Visualization**: Generate visual representations of the knowledge graph schema
 - **Mermaid Class Diagrams**: Create and clean Mermaid-format class diagrams of the KG schema
 
@@ -242,35 +244,93 @@ Each link below points to a chat transcript that demonstrates how to generate a 
 
 ## MCP Tools Reference
 
+The server exposes **22 tools** plus a `plot://{filename}` resource template. Tools are listed below grouped by category. The specialist tools should be preferred over the generic `query` tool — server.py's `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
+
+### Schema & metadata
+
 | Tool | Description |
 |------|-------------|
 | `get_neo4j_schema` | List all node types, their attributes, and relationships in the knowledge graph |
-| `query` | Execute a read-only Cypher query on the Neo4j database |
 | `get_node_metadata` | Get descriptions of all node types from MetaNode entries |
 | `get_relationship_metadata` | Get descriptions of all relationship types and their properties |
-| `get_study_info` | Get detailed information about a specific study and its assays |
-| `find_differentially_expressed_genes` | Find up/downregulated genes for a given assay |
-| `find_differentially_methylated_regions` | Find hyper/hypomethylated regions for a given assay |
-| `find_differentially_abundant_organisms` | Find organisms with differential abundance for a given assay |
-| `find_common_differentially_expressed_genes` | Find genes differentially expressed across multiple assays |
-| `select_assays` | Browse and filter assays by study, organism, technology, or measurement |
-| `create_volcano_plot` | Generate a volcano plot of differential expression results |
-| `create_venn_diagram` | Create a Venn diagram comparing DEGs across 2–3 assays |
+| `visualize_schema` | Generate a visual schema diagram of the knowledge graph |
+
+### Study / assay browsing
+
+| Tool | Description |
+|------|-------------|
+| `get_study_info` | Get detailed information about a specific study and its assays (metadata + assay inventory) |
+| `select_assays` | Browse and filter assays by study, organism, technology, or measurement; resolve a factor pair to one or more assay IDs |
+
+### Single-assay analyses
+
+| Tool | Description |
+|------|-------------|
+| `find_differentially_expressed_genes` | Find up/downregulated genes for a given assay (DESeq2) |
+| `find_differentially_methylated_regions` | Find hyper/hypomethylated regions for a given assay, with optional `in_promoter` / `in_exon` / `in_intron` / distance filters |
+| `find_differentially_abundant_organisms` | Find organisms with differential abundance for a given assay (DESeq2 and/or ANCOM-BC) |
+
+### Cross-assay analyses
+
+| Tool | Description |
+|------|-------------|
+| `find_common_differentially_expressed_genes` | Intersect DEGs across multiple assays (up and down directions kept separate) |
+| `find_common_differentially_methylated_regions` | Intersect DMRs across multiple assays, with optional MethylationRegion filters |
+| `find_common_differentially_abundant_organisms` | Intersect differentially abundant organisms across multiple assays |
+| `find_common_de_genes_overlapping_dm_regions` | Identify DE genes whose promoter (or other region) is also differentially methylated — supports method-aware significance filtering and pooled-DM evidence across multiple methylation assays |
+
+### Cypher fallback
+
+| Tool | Description |
+|------|-------------|
+| `query` | Execute a read-only Cypher query on the Neo4j database. Fallback for questions the specialists don't cover — the `DEFAULT_INSTRUCTIONS` policy directs the LLM to use specialist tools first |
+
+### Plot generation, delivery, and saving
+
+| Tool / resource | Description |
+|------|-------------|
+| `create_volcano_plot` | Generate a volcano plot of differential expression / methylation / abundance results; PNG returned inline and registered for resource fetch |
+| `create_venn_diagram` | Create a Venn diagram comparing DEGs / DMRs / DA organisms across 2 or 3 assays (also supports the `expression_methylation` 2×2 grid variant); PNG returned inline and registered for resource fetch |
+| `fetch_plot` | Re-fetch the canonical PNG bytes of a previously generated plot from the in-memory registry (last 8 plots, FIFO eviction). Returns the bytes as an `EmbeddedResource` so clients can render them inline. Safe to call repeatedly — no Cypher, no matplotlib, no re-render |
+| `get_save_script` | Return a markdown block with multiple save options for a previously generated plot: right-click save, ask-LLM-client-to-save, or fetch via the `plot://` resource URI |
+| `plot://{filename}` (resource) | MCP resource template — clients fetch PNG bytes via `resources/read` on `plot://<suggested_filename>`. Decoupled from the tool response that generated the plot, so a failed fetch can be retried without re-running the analysis |
+
+### Output paths
+
+| Tool | Description |
+|------|-------------|
+| `set_output_directory` | Set the user-facing directory where plots and CSV files should be saved |
+| `get_output_directory` | Return the currently configured output directory |
+
+### Mermaid & transcript utilities
+
+| Tool | Description |
+|------|-------------|
 | `clean_mermaid_diagram` | Clean and validate a Mermaid class diagram of the KG schema |
 | `create_chat_transcript` | Export the current chat as a formatted transcript |
-| `visualize_schema` | Generate a visual schema diagram of the knowledge graph |
 
 ## Security
 
-All Neo4j sessions are opened with `default_access_mode=READ_ACCESS`, which is enforced at the Bolt protocol level by Neo4j. Any write operation (CREATE, MERGE, SET, DELETE, REMOVE, DROP) is rejected with the error: *"Write operations are not allowed for READ transactions."* This works on both Community and Enterprise Edition.
+All Neo4j sessions are opened with `default_access_mode=READ_ACCESS`, which is enforced at the Bolt protocol level by Neo4j. Any write operation is rejected with the error: *"Write operations are not allowed for READ transactions."* This works on both Community and Enterprise Edition.
 
-Additionally, the `query` tool includes a regex-based write filter (`_is_write_query()`) that catches write keywords before queries are sent to Neo4j, and all queries use `session.execute_read()` for transaction-level read enforcement.
+As a second layer of defense, the `query` tool includes a regex-based write filter (`_is_write_query()`) that catches the Cypher write keywords `MERGE`, `CREATE`, `SET`, `DELETE`, `REMOVE`, `ADD`, and `DROP` (case-insensitive) before the query is sent to Neo4j. All queries also use `session.execute_read()` for transaction-level read enforcement. The two layers — server-side regex + Bolt-level READ_ACCESS — protect the knowledge graph from modification even if one layer is bypassed.
 
 ---
 
 ## Development
 
 [Instructions for local development](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/development.md)
+
+## Testing
+
+The project ships a pytest suite (95 tests across 8 files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), and the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees).
+
+```bash
+pip install -r requirements-test.txt
+pytest
+```
+
+The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHub Actions workflow at `.github/workflows/test.yml` runs the suite on Python 3.10 through 3.13 for every push and pull request. See `tests/README.md` for the per-file breakdown and instructions on adding tests for new tools.
 
 ## Building and Publishing (maintainers only)
 
@@ -311,17 +371,17 @@ This project is licensed under the BSD 3-Clause License. See the [LICENSE](LICEN
 If you use MCP GeneLab in your research, please cite the following works:
 
 ```bibtex
-@software{rose2025mcp-genelab,
+@software{rose2026mcp-genelab,
   title={MCP GeneLab Server},
   author={Rose, P.W. and Saravia-Butler, A.M. and Nelson, C.A. and Shi, Y. and Baranzini, S.E.},
-  year={2025},
+  year={2026},
   url={https://github.com/sbl-sdsc/mcp-genelab}
 }
 
-@software{rose2025spoke-genelab,
+@software{rose2026spoke-genelab,
   title={NASA SPOKE-GeneLab Knowledge Graph},
   author={Rose, P.W. and Nelson, C.A. and Saravia-Butler, A.M. and Gebre, S.G. and Soman, K. and Grigorev, K.A. and Sanders, L.M. and Costes, S.V. and Baranzini, S.E.},
-  year={2025},
+  year={2026},
   url={https://github.com/BaranziniLab/spoke_genelab}
 }
 ```

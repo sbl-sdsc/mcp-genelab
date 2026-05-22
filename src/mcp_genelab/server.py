@@ -29,6 +29,132 @@ from pydantic import Field
 logger = logging.getLogger("mcp-genelab")
 logger.setLevel(logging.DEBUG)
 
+
+# ===========================================================================
+# Output-directory configuration
+# ===========================================================================
+# The MCP server may run in three different deployment contexts:
+#
+#   1. AWS Bedrock AgentCore Runtime — server is in an ephemeral Firecracker
+#      microVM, container filesystem is NOT reachable by the user. Any file the
+#      server writes lives only inside the microVM until session end. There is
+#      no network mount, no bind mount, no way for the server to push bytes to
+#      the user's local disk directly.
+#
+#   2. Claude.ai chat UI — server runs on the user's machine via stdio, and
+#      Claude's analysis runtime separately mounts /mnt/user-data/outputs/
+#      which the LLM's bash_tool can read. Files written there become
+#      downloadable via Claude's present_files tool.
+#
+#   3. Local stdio — server is a child process on the user's own machine.
+#      ~/Downloads works because the path resolves to the user's filesystem.
+#
+# In context (1), the user CANNOT receive files by having the server write to
+# its own disk — that disk is unreachable. The only mechanisms that work are:
+#   (a) Inline content: ImageContent (PNG) and TextContent (markdown/CSV) come
+#       back in the JSON-RPC response, are passed through by AgentCore unchanged,
+#       and are rendered by the user's MCP client.
+#   (b) Embedded shell commands: a TextContent block carries the base64 image
+#       bytes and a copy-paste-ready `python3 -c "..."` command the user (or
+#       their LLM-with-bash) can run on their own machine to materialize the
+#       file at any path they want.
+#
+# To let the user specify a save path on their own machine, the new
+# `set_output_directory` tool stores a path string in this module-level dict
+# keyed by what we have available for session identity. In AgentCore stateless
+# mode, FastMCP passes through the Mcp-Session-Id header but we cannot reliably
+# read it from inside a tool. So we use a single module-level variable: each
+# microVM serves exactly one user session, so a single global is correct for
+# AgentCore. For multiplexed deployments (uncommon), users would each call
+# `set_output_directory` at the start of their session.
+#
+# The stored path is used in two ways:
+#   - In stdio / local deployments, the server writes the file there directly.
+#   - In all deployments, the path is used as the suggested save location in
+#     the embedded shell command emitted with every plot.
+# ===========================================================================
+
+_USER_OUTPUT_DIR: Optional[str] = None
+"""User-specified path string where output files should be saved. Set by
+set_output_directory. Used as the suggested save location in embedded shell
+commands and (when reachable, i.e. in stdio/local mode) as the actual write
+target for the server's own file output."""
+
+
+def _get_user_output_dir() -> Optional[str]:
+    """Return the user-specified output directory if set, else None."""
+    return _USER_OUTPUT_DIR
+
+
+def _set_user_output_dir(path: str) -> None:
+    """Set the user-specified output directory. Caller is responsible for
+    validation; this just stores the string."""
+    global _USER_OUTPUT_DIR
+    _USER_OUTPUT_DIR = path
+
+
+# ---------------------------------------------------------------------------
+# Last-plot registry
+# ---------------------------------------------------------------------------
+# Stores the PNG bytes and user-facing path of the most recently generated
+# plot, keyed by the suggested filename. Used by `get_save_script` so the
+# user can request a copy-paste-ready Python save script ON DEMAND, rather
+# than having every plot response carry one inline (which doubles the
+# response size and burns conversation context).
+#
+# The registry is bounded to MAX_LAST_PLOTS entries (FIFO eviction) so
+# memory stays predictable in long sessions. PNG bytes for evicted entries
+# are dropped — if the user asks for a save script for an old plot they'll
+# need to regenerate it. In AgentCore Runtime each session is its own
+# microVM, so the bound is more of a hygiene measure than a hard need.
+# ---------------------------------------------------------------------------
+
+_LAST_PLOTS: "dict[str, tuple[bytes, str]]" = {}
+"""Map of suggested_filename → (png_bytes, user_facing_path) for recently
+generated plots, available for on-demand save-script retrieval via
+the `get_save_script` tool."""
+
+MAX_LAST_PLOTS = 8
+"""Maximum number of plots to retain bytes for. Older entries are evicted
+FIFO. Tuned to cover a typical analysis session (a few volcano plots +
+a few Venn diagrams) without bloating memory."""
+
+
+def _register_plot(suggested_filename: str, png_bytes: bytes, user_facing_path: str) -> None:
+    """Record a freshly-generated plot's bytes so a save script can be
+    produced on demand later. FIFO-evicts to keep MAX_LAST_PLOTS entries."""
+    # If already registered (re-generation of the same plot), update in place
+    # rather than evicting; this also preserves insertion order.
+    _LAST_PLOTS[suggested_filename] = (png_bytes, user_facing_path)
+    while len(_LAST_PLOTS) > MAX_LAST_PLOTS:
+        # Pop the oldest entry. In Python 3.7+ dicts preserve insertion order.
+        oldest = next(iter(_LAST_PLOTS))
+        del _LAST_PLOTS[oldest]
+
+
+def _lookup_plot(suggested_filename: str) -> "Optional[tuple[bytes, str]]":
+    """Return (png_bytes, user_facing_path) for a previously-registered plot,
+    or None if the filename isn't in the registry (e.g. it was evicted, or it
+    came from a different session)."""
+    return _LAST_PLOTS.get(suggested_filename)
+
+
+def _list_registered_plots() -> "list[str]":
+    """Return the suggested filenames currently in the registry, oldest first."""
+    return list(_LAST_PLOTS.keys())
+
+
+def _is_remote_deployment() -> bool:
+    """True when this server is running in a transport mode where the
+    container's filesystem is not reachable by the user (e.g. AgentCore
+    Runtime, any streamable-http deployment). False in local stdio mode.
+
+    In remote deployment, server-side file writes don't deliver files to the
+    user — only inline content + embedded shell commands do."""
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    return transport in ("streamable-http", "http", "sse")
+
+
 async def _read(tx: AsyncTransaction, query: str, params: dict[str, Any]) -> str:
     """Run a read query and return the records as a JSON string.
 
@@ -58,51 +184,163 @@ async def _read_with_count(tx: AsyncTransaction, query: str, params: dict[str, A
 def _is_write_query(query: str) -> bool:
     """Check if the query is a write query."""
     return (
-        re.search(r"\b(MERGE|CREATE|SET|DELETE|REMOVE|ADD)\b", query, re.IGNORECASE)
+        re.search(r"\b(MERGE|CREATE|SET|DELETE|REMOVE|ADD|DROP)\b", query, re.IGNORECASE)
         is not None
     )
 
 
-def _resolve_output_paths(filename_stem: str, extension: str = "csv") -> tuple[str, str]:
-    """Resolve the output file path and download link, mirroring the pattern used
-    by create_volcano_plot/create_venn_diagram. Returns (output_path, download_link).
+def _resolve_output_paths(filename_stem: str, extension: str = "csv") -> tuple[str, str, str]:
+    """Resolve where output files should be written and how to surface the
+    download path to the user. Returns a 3-tuple:
+      - write_path: where the server actually writes the file (inside its
+        own filesystem; may not be user-reachable in remote deployments)
+      - user_facing_path: what to show the user as where they will find the
+        file (the user_output_dir + sanitized filename, when set; otherwise
+        the same as write_path)
+      - download_link: a file:// or computer:// URI suitable for present_files
+        / chat-UI download links
 
-    The filename_stem is sanitized; only [A-Za-z0-9_-] are kept, repeated underscores
-    are collapsed, and the stem is truncated to a safe length for common filesystems.
+    Precedence (highest to lowest):
+      1. User-specified path via set_output_directory — used as the user-facing
+         save location. When the path is reachable from this process (stdio /
+         local deployment), the server also WRITES there. In remote deployment,
+         the path is only a suggestion shown to the user in the embedded save
+         command; the server still writes its working copy to /tmp.
+      2. /mnt/user-data/outputs if it exists — Claude.ai analysis-environment
+         convention. The server writes there and uses a `computer://` link.
+      3. ~/Downloads — direct local stdio with no Claude analysis env.
+
+    The filename_stem is sanitized to [A-Za-z0-9_-], collapsing repeated
+    underscores, and truncated+hashed if longer than 200 chars.
     """
     safe = re.sub(r'[^\w\-]', '_', filename_stem)
     safe = re.sub(r'_+', '_', safe).strip('_') or "results"
-    # Linux filename limit is 255 bytes; keep well under it after extension is appended.
     if len(safe) > 200:
-        # Hash the tail to keep uniqueness while staying short.
         import hashlib
         digest = hashlib.sha1(safe.encode("utf-8")).hexdigest()[:10]
         safe = safe[:180] + "_" + digest
-    is_claude_env = os.path.exists('/mnt/user-data/outputs')
-    if is_claude_env:
-        output_dir = '/mnt/user-data/outputs'
-        output_path = os.path.join(output_dir, f'{safe}.{extension}')
-        download_link = f"computer:///mnt/user-data/outputs/{safe}.{extension}"
-    else:
-        output_dir = os.path.expanduser('~/Downloads')
-        output_path = os.path.join(output_dir, f'{safe}.{extension}')
-        download_link = f"file://{output_path}"
-    return output_path, download_link
+    filename = f'{safe}.{extension}'
+
+    user_dir = _get_user_output_dir()
+    if user_dir:
+        # The user has declared where they want files. Use that path as the
+        # user-facing location regardless of whether we can actually write
+        # there ourselves. In remote deployments, the inline ImageContent
+        # plus the embedded save command is what actually puts the file on
+        # the user's machine.
+        user_facing = os.path.join(user_dir, filename)
+        if _is_remote_deployment():
+            # Server cannot reach user_dir, so write a working copy to a
+            # location we KNOW is writable (the microVM's /tmp). The
+            # working copy is only used to support inline base64 encoding;
+            # the user's actual file comes from the embedded save command.
+            write_path = os.path.join('/tmp', filename)
+        else:
+            # stdio/local mode — user_dir should be reachable; write there.
+            write_path = user_facing
+        return write_path, user_facing, f"file://{user_facing}"
+
+    # No user-specified path — fall back to legacy behavior.
+    if os.path.exists('/mnt/user-data/outputs'):
+        path = os.path.join('/mnt/user-data/outputs', filename)
+        return path, path, f"computer:///mnt/user-data/outputs/{filename}"
+
+    if _is_remote_deployment():
+        # No user dir set AND in remote deployment. Write the server's working
+        # copy to /tmp (somewhere we know is writable inside the microVM), but
+        # surface a USER-FACING path of ./<filename> — that's where the user's
+        # save script will land the file when they run it on their own machine
+        # (which they presumably do from a directory of their choice). This is
+        # friendlier than dumping the AgentCore microVM's /tmp path on them.
+        path = os.path.join('/tmp', filename)
+        user_facing = f"./{filename}"
+        return path, user_facing, (
+            f"file://{user_facing}  "
+            f"(No output directory set; the save script defaults to the user's "
+            f"current working directory. Call set_output_directory(path='...') "
+            f"first to override this.)"
+        )
+
+    path = os.path.join(os.path.expanduser('~/Downloads'), filename)
+    return path, path, f"file://{path}"
+
+
+def _render_csv_text(rows: list[dict]) -> Optional[str]:
+    """Render a list of dict rows to an in-memory CSV string.
+
+    Returns the CSV text on success, or None for empty/None input. The
+    column order is the union of all keys, preserving first-seen ordering
+    so pandas/Excel users see a stable layout.
+
+    This helper is paired with `_write_results_csv` in tools that want both:
+      - a file on disk (for stdio-mode local users; written via `_write_results_csv`)
+      - the CSV text inline in the response (so remote-deployment users can
+        copy-and-save without depending on the unreachable container path).
+
+    The two helpers are kept separate so callers can still write a file
+    only (legacy behavior) or render only the inline text — without
+    duplicating the dict-rows-to-CSV serialization logic.
+    """
+    if not rows:
+        return None
+    try:
+        import csv as _csv
+        import io
+        fieldnames: list[str] = []
+        seen: set = set()
+        for r in rows:
+            for k in r.keys():
+                if k not in seen:
+                    seen.add(k)
+                    fieldnames.append(k)
+        buf = io.StringIO()
+        writer = _csv.DictWriter(buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+        return buf.getvalue()
+    except Exception as e:
+        logger.warning(f"Failed to render CSV text: {e}")
+        return None
 
 
 def _write_results_csv(rows: list[dict], filename_stem: str) -> tuple[Optional[str], Optional[str]]:
     """Write a list of dict rows to a CSV file using the standard output dir pattern.
 
-    Returns (output_path, download_link) on success, or (None, None) on failure.
-    The CSV is written using csv.DictWriter, preserving the column order of the first row.
-    Empty/None row lists produce no file and return (None, None).
+    Returns (user_facing_path, download_link) on success, or (None, None) on failure.
+
+    Behavior depends on deployment mode:
+      - Local stdio mode (`_is_remote_deployment()` is False): the server writes
+        the CSV to disk at the resolved path so users on their own machine can
+        open the file directly.
+      - Remote mode (AgentCore Runtime / streamable-http): the server SKIPS the
+        disk write — the microVM filesystem isn't reachable by the user, so a
+        file in `/tmp` is just leaked I/O. The CSV reaches the user via the
+        inline fenced `csv` code block in the response (rendered by every MCP
+        client). We still return a suggested user-facing path string and a
+        download_link, so the response can name the file with a sensible
+        filename for the user to save the inline CSV as.
+
+    The CSV is written using csv.DictWriter, preserving the union of keys
+    across all rows (first row's order takes precedence). Empty/None row
+    lists produce no file and return (None, None).
     """
     if not rows:
         return None, None
     try:
+        write_path, user_facing_path, download_link = _resolve_output_paths(
+            filename_stem, extension="csv"
+        )
+        # In remote mode the inline CSV is the user's only reachable copy.
+        # Writing to /tmp inside the microVM accomplishes nothing except
+        # consuming temp space, which can leak across stateful sessions.
+        # We still need to return the user_facing_path / download_link so the
+        # response can present a meaningful suggested filename.
+        if _is_remote_deployment():
+            return user_facing_path, download_link
+
         import csv as _csv
-        output_path, download_link = _resolve_output_paths(filename_stem, extension="csv")
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        os.makedirs(os.path.dirname(write_path), exist_ok=True)
         # Use the union of keys across all rows (first row's order takes precedence)
         fieldnames: list[str] = []
         seen: set = set()
@@ -111,36 +349,324 @@ def _write_results_csv(rows: list[dict], filename_stem: str) -> tuple[Optional[s
                 if k not in seen:
                     seen.add(k)
                     fieldnames.append(k)
-        with open(output_path, "w", newline="", encoding="utf-8") as f:
+        with open(write_path, "w", newline="", encoding="utf-8") as f:
             writer = _csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for r in rows:
                 writer.writerow(r)
-        return output_path, download_link
+        return user_facing_path, download_link
     except Exception as e:
         logger.warning(f"Failed to write CSV for {filename_stem}: {e}")
         return None, None
 
 
-def _canonical_block(table_md: str, csv_path: Optional[str], csv_link: Optional[str], context_label: str = "results table") -> str:
-    """Wrap a markdown table with an optional CSV side-channel reference.
+def _canonical_block(
+    table_md: str,
+    csv_path: Optional[str],
+    csv_link: Optional[str],
+    context_label: str = "results table",
+    csv_text: Optional[str] = None,
+) -> str:
+    """Wrap a markdown table with an inline CSV download alongside it.
 
-    Returns the table as-is, optionally followed by a single italicized line pointing
-    to a server-written CSV. The CSV gives the user a byte-exact downloadable artifact
-    of the same data. No instructions for the assistant are embedded — presentation is
-    the caller's responsibility.
+    The markdown table renders as a human-friendly table. The CSV text, if
+    supplied, is wrapped in a fenced ``csv`` code block immediately below
+    the table, with a caption naming the suggested filename. Together the
+    user gets:
+      - a readable table for visual inspection, AND
+      - byte-exact CSV text they can copy-and-save, or ask their LLM client
+        to write to disk via local file access (filesystem MCP, Cline,
+        Cursor, etc.).
 
-    The context_label parameter is accepted for backwards compatibility but no longer used.
+    Why inline CSV text and not a `_CSV: /path/...` reference:
+      In remote deployments (AgentCore Runtime), the server runs in an
+      ephemeral microVM whose filesystem is not reachable by the user. A
+      `_CSV: /tmp/foo.csv` line would point to a path the user can't open.
+      Inline CSV text is plain markdown and is delivered to every MCP
+      client, ephemeral container or not.
+
+    Callers that only pass `csv_path` (no `csv_text`) fall through to a
+    `_CSV: <path>` reference line for local-mode compatibility.
     """
     out = table_md
-    if csv_path:
+    if csv_text:
+        # Suggested filename: prefer the basename of csv_path when available;
+        # fall back to a generic "data.csv" otherwise. This is what appears
+        # in the caption.
+        suggested_name = os.path.basename(csv_path) if csv_path else "data.csv"
+        out += (
+            f"\n\n**CSV (copy-and-save as `{suggested_name}`):**\n"
+            f"```csv\n{csv_text}```\n"
+        )
+    elif csv_path:
+        # Path-reference fallback for callers that don't supply inline CSV text.
         out += f"\n\n_CSV: `{csv_path}`_"
     return out
+
+
+def _make_save_instructions(
+    user_facing_path: str,
+    suggested_filename: str,
+    png_size_bytes: int,
+) -> str:
+    """Build a markdown block listing the available retrieval paths for
+    the PNG bytes of a previously generated plot.
+
+    The response references the canonical resource URI (plot://<filename>)
+    and the fetch_plot tool. Both retrieve the bytes from the in-memory
+    plot registry via a separate request, independent of this tool's
+    response. The registry holds the last MAX_LAST_PLOTS plots
+    (FIFO eviction), so resource URIs remain stable across calls within
+    a session and a failed fetch can be retried without re-rendering.
+
+    Args:
+        user_facing_path: where the user has asked files to be saved.
+            Used in the "ask your LLM client to save it" guidance, since
+            an LLM client with filesystem access needs a target path.
+        suggested_filename: the bare filename (no directory). Used to
+            construct the plot:// URI and the fetch_plot call.
+        png_size_bytes: size of the PNG in bytes, shown to the user so
+            they know what to expect.
+    """
+    size_kb = max(1, png_size_bytes // 1024)
+    return (
+        f"\n---\n"
+        f"### Download options for `{suggested_filename}` ({size_kb} KB)\n\n"
+        f"The plot above is included inline in this response. To save it to "
+        f"your local computer at `{user_facing_path}`, choose whichever option "
+        f"works in your environment:\n\n"
+        f"**Option A — Right-click the image above** and choose \"Save Image As…\" "
+        f"(works in most chat UIs that render MCP images inline). This is the "
+        f"simplest path for most users.\n\n"
+        f"**Option B — Ask your LLM client to save it.** If your client has a "
+        f"filesystem MCP server, write tool, or local shell access (Cline, "
+        f"Cursor, Claude Code, the filesystem MCP server), ask it to save the "
+        f"inline PNG to `{user_facing_path}`. If the inline image is missing "
+        f"or didn't render cleanly, the LLM can re-fetch the canonical bytes "
+        f"without re-rendering by calling `fetch_plot(filename=\"{suggested_filename}\")` "
+        f"or reading the resource at `plot://{suggested_filename}`.\n\n"
+        f"**Option C — Re-fetch via resource URI.** Clients that support MCP "
+        f"resources can fetch the canonical PNG bytes via "
+        f"`resources/read` on `plot://{suggested_filename}`. This is the most "
+        f"robust path because the fetch is a separate request that can be "
+        f"retried if the original response was corrupted in transit.\n"
+    )
+
+
+
+def _make_save_hint(
+    user_facing_path: str,
+    suggested_filename: str,
+    png_size_bytes: int,
+) -> str:
+    """Build a SHORT (~400-byte) download hint for a freshly generated plot.
+
+    This is the default download guidance every plot tool emits. It points
+    the user at the three save mechanisms (right-click, LLM filesystem tool,
+    on-demand Python script) WITHOUT embedding the full base64 payload —
+    embedding it inline with every plot response would roughly double the
+    response size and consume conversation context faster than necessary.
+    The embedded-script form is delivered separately by the `get_save_script`
+    tool only when the user explicitly asks for it.
+
+    Args:
+        user_facing_path: where the user has asked files to be saved.
+        suggested_filename: bare filename (no directory), used to identify
+            this plot when the user later asks `get_save_script` for it.
+        png_size_bytes: size of the PNG in bytes, shown to the user so they
+            know what to expect.
+    """
+    size_kb = max(1, png_size_bytes // 1024)
+    return (
+        f"\n---\n"
+        f"### Save `{suggested_filename}` ({size_kb} KB)\n\n"
+        f"The plot above is included inline. To save it to "
+        f"`{user_facing_path}` on your computer, use any of these:\n\n"
+        f"- **Right-click the image above** → \"Save Image As…\" (works in "
+        f"every chat UI that renders MCP images).\n"
+        f"- **Ask your LLM client to save it** if it has filesystem access "
+        f"(filesystem MCP server, Cline, Cursor, Claude Code). If the inline "
+        f"image is missing or rendered poorly, the LLM can call "
+        f"`fetch_plot(filename=\"{suggested_filename}\")` or read "
+        f"`plot://{suggested_filename}` to re-fetch the canonical bytes "
+        f"without re-rendering.\n"
+        f"- **Get full save options:** call `get_save_script("
+        f"filename=\"{suggested_filename}\")` to receive a markdown block "
+        f"describing every available retrieval path (right-click, "
+        f"resource URI, fetch_plot).\n"
+    )
+
 
 def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instructions: str = "", host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
     mcp: FastMCP = FastMCP("mcp-genelab", dependencies=["neo4j", "pydantic"], instructions=instructions, host=host, port=port, stateless_http=True)
 
-    @mcp.tool()
+    # Plot resource layer: every plot generated by create_volcano_plot or
+    # create_venn_diagram is held in _LAST_PLOTS and exposed as an MCP
+    # resource under the plot://<suggested_filename> URI. Clients fetch the
+    # bytes via `resources/read` (or via the fetch_plot tool below) in a
+    # separate request from the tool call that produced the plot, so a
+    # failed fetch can be retried without re-running Cypher + matplotlib.
+    # The URI's filename is the same key the tools use to register and
+    # look up plots, so resource URIs are stable within a session.
+
+    @mcp.resource(
+        "plot://{filename}",
+        name="plot",
+        title="Plot PNG (Volcano / Venn)",
+        description=(
+            "Binary PNG bytes for a plot previously generated by "
+            "create_volcano_plot or create_venn_diagram. The {filename} "
+            "parameter is the suggested_filename surfaced in the plot "
+            "tool's response (e.g. 'venn_expression_2way_OSD-244.png'). "
+            "The server keeps the last 8 plots in memory; older plots "
+            "are evicted FIFO. Retrieve the same plot again by re-fetching "
+            "this URI — no need to re-render."
+        ),
+        mime_type="image/png",
+    )
+    def plot_resource(filename: str) -> bytes:
+        """Return the PNG bytes for a registered plot, or raise ValueError if
+        the plot is not in the registry. FastMCP base64-encodes the bytes into
+        a BlobResourceContents automatically and delivers them via resources/read.
+
+        Notes:
+          - This is a READ-ONLY accessor. It does not mutate the registry.
+          - Repeated reads of the same URI return the same bytes (idempotent).
+          - If the plot has been evicted by the FIFO bound, the caller gets a
+            clear error and can re-run the plot tool to regenerate it.
+        """
+        looked_up = _lookup_plot(filename)
+        if looked_up is None:
+            available = ", ".join(_list_registered_plots()) or "(none)"
+            raise ValueError(
+                f"No plot named {filename!r} is in the registry. "
+                f"Available plots: {available}. The registry holds the "
+                f"last {MAX_LAST_PLOTS} plots; older entries are evicted."
+            )
+        png_bytes, _user_facing_path = looked_up
+        return png_bytes
+
+    # fetch_plot: companion to the plot:// resource for clients that don't
+    # surface MCP resources well. Returns the same bytes as an
+    # EmbeddedResource via the tool interface. Pure registry lookup + encode
+    # — no Cypher, no matplotlib — so it's safe to call repeatedly and the
+    # canonical bytes are stable across calls within a session.
+
+    @mcp.tool(
+        annotations={
+            "title": "Fetch Plot Bytes (registry lookup)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
+    async def fetch_plot(
+        filename: str = Field(
+            ...,
+            description=(
+                "Suggested filename of a previously generated plot "
+                "(e.g. 'venn_expression_2way_OSD-244.png'). Look at the "
+                "most recent create_volcano_plot or create_venn_diagram "
+                "response — the filename appears in the 'Save' block. "
+                "The server keeps the last 8 plots in memory."
+            ),
+        ),
+    ) -> list[types.Content]:
+        """Re-fetch the PNG bytes of a previously generated plot.
+
+        WHEN TO USE THIS TOOL:
+        Call this when you need the canonical PNG bytes for a plot that's
+        already been generated. Common cases:
+          - The inline image in the original plot tool response was
+            corrupted or didn't render in the client.
+          - You need the bytes for a downstream step (e.g. embedding in a
+            transcript, saving to a side file, base64-encoding for an
+            external API).
+          - The user asked to see the plot again without re-running the
+            analysis.
+
+        WHAT THIS TOOL DOES NOT DO:
+        It does NOT re-render the plot. It returns the same bytes that
+        were registered when the plot was originally generated. If the
+        underlying data has changed, re-run the plot tool itself
+        (create_volcano_plot, create_venn_diagram); don't expect fetch_plot
+        to pick up new data.
+
+        EQUIVALENT RESOURCE URI:
+        This tool returns the same bytes that `resources/read` would return
+        for `plot://<filename>`. Use whichever path your client supports
+        better — resources for clients that render them well, this tool for
+        clients that don't.
+
+        REGISTRY BOUNDS:
+        The registry holds the last 8 plots (FIFO eviction). Older plots
+        return a clear "not in registry" error and need to be regenerated
+        by re-running the source plot tool.
+        """
+        if not filename or not filename.strip():
+            return [types.TextContent(
+                type="text",
+                text=(
+                    "Error: `filename` is required. Pass the suggested "
+                    "filename surfaced by the most recent plot tool response."
+                ),
+            )]
+
+        looked_up = _lookup_plot(filename.strip())
+        if looked_up is None:
+            available = _list_registered_plots()
+            hint = (
+                "Available plots: " + ", ".join(f"`{p}`" for p in available)
+                if available
+                else "No plots are currently in the registry."
+            )
+            return [types.TextContent(
+                type="text",
+                text=(
+                    f"No plot named `{filename}` is in the registry "
+                    f"(only the last {MAX_LAST_PLOTS} plots are retained).\n\n"
+                    f"{hint}\n\n"
+                    f"Re-run create_volcano_plot or create_venn_diagram with "
+                    f"the same arguments to regenerate."
+                ),
+            )]
+
+        png_bytes, user_facing_path = looked_up
+        b64 = base64.standard_b64encode(png_bytes).decode("ascii")
+        size_kb = max(1, len(png_bytes) // 1024)
+
+        # Return as EmbeddedResource so the client can render the bytes
+        # inline using the resource UI, with the plot:// URI as the canonical
+        # reference. We also include a short TextContent summary so the LLM
+        # gets a textual confirmation of what was returned.
+        return [
+            types.TextContent(
+                type="text",
+                text=(
+                    f"Returning PNG bytes for `{filename}` ({size_kb} KB). "
+                    f"Canonical URI: `plot://{filename}`. "
+                    f"Local save path (if filesystem write is available): "
+                    f"`{user_facing_path}`."
+                ),
+            ),
+            types.EmbeddedResource(
+                type="resource",
+                resource=types.BlobResourceContents(
+                    uri=f"plot://{filename}",
+                    mimeType="image/png",
+                    blob=b64,
+                ),
+            ),
+        ]
+
+    @mcp.tool(
+        annotations={
+            "title": "Get Neo4j Schema",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def get_neo4j_schema() -> list[types.TextContent]:
         """List all nodes, their attributes and their relationships to other nodes in the neo4j database.
         If this fails with a message that includes "Neo.ClientError.Procedure.ProcedureNotFound"
@@ -171,19 +697,331 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             logger.error(f"Database error retrieving schema: {e}")
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Set Output Directory",
+            "readOnlyHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
+    async def set_output_directory(
+        path: str = Field(
+            ...,
+            description=(
+                "Absolute path on the USER's local machine where output files "
+                "(volcano plots, Venn diagrams, CSV exports) should be saved. "
+                "Examples: '/Users/jane/Downloads', '/home/jane/Downloads', "
+                "'C:/Users/Jane/Downloads' (forward slashes work on Windows too "
+                "with pathlib). Avoid trailing path separators."
+            ),
+        ),
+    ) -> list[types.TextContent]:
+        """Configure the output directory for files generated by this MCP server.
+
+        WHEN TO USE THIS TOOL:
+        Call this tool at the START of a session, before any tool that produces
+        a downloadable file (create_volcano_plot, create_venn_diagram, or any
+        tool that emits a CSV). The path you specify is where the user wants
+        finished files to end up on THEIR OWN local machine.
+
+        WHAT IT DOES:
+        Stores the provided path string in the server's session-scoped state.
+        Every subsequent file-producing tool uses this path:
+          - As the user-facing save location shown in the response summary.
+          - As the default target path embedded in the download-helper script
+            included with every plot.
+          - If the server is running locally (stdio transport), the server
+            ALSO writes the file directly to this path.
+
+        IMPORTANT — DEPLOYMENT REALITY:
+        When this MCP server is deployed on AWS Bedrock AgentCore Runtime (or
+        any other remote container service), the server runs in an ephemeral
+        microVM whose filesystem is NOT reachable from the user's machine. The
+        server CANNOT write a file directly to the user's local disk over the
+        network — no MCP server in a container can. The path you set here is
+        a suggestion that propagates through the response in three ways, any
+        of which lets the user save the file locally:
+          (a) The plot is returned inline as ImageContent and renders in any
+              MCP client that displays images (Claude Desktop, Cursor, Cline,
+              Claude.ai web, ChatGPT custom GPTs, Gemini, etc.). The user can
+              right-click and "Save Image As" — most clients default to the
+              user's Downloads folder, which is usually what was asked for.
+          (b) The path you set appears in a download-helper script in the
+              response. LLM clients with local filesystem access (Claude Code,
+              Cursor, Cline, Claude Desktop with a filesystem MCP server) can
+              run this script automatically to write the file at exactly this
+              path.
+          (c) Users without LLM-mediated filesystem access can copy the
+              script into a file and run `python save_plot.py` themselves on
+              their own machine. This is cross-platform (macOS/Linux/Windows)
+              and uses no third-party packages.
+
+        VALIDATION:
+        The path is stored as-is (the server does not verify it exists on the
+        user's machine — it has no way to do so from inside a container). If
+        you pass a relative path or an obviously malformed string the server
+        will accept it; the failure will surface when the user tries to save
+        the file locally.
+        """
+        if not path or not path.strip():
+            return [types.TextContent(
+                type="text",
+                text="Error: path must be a non-empty string.",
+            )]
+
+        # Strip whitespace and normalize trailing separators. Don't expanduser
+        # here — ~ should be expanded by whatever client/script ultimately
+        # writes the file, since the server's home directory is inside the
+        # AgentCore microVM (irrelevant to the user).
+        cleaned = path.strip().rstrip('/').rstrip('\\')
+        _set_user_output_dir(cleaned)
+
+        deployment_mode = (
+            "remote (AgentCore / streamable-http)"
+            if _is_remote_deployment() else "local (stdio)"
+        )
+        logger.info(f"Output directory set to: {cleaned} (deployment: {deployment_mode})")
+
+        if _is_remote_deployment():
+            advisory = (
+                f"\n\n**Deployment note:** This MCP server runs in an ephemeral "
+                f"container that cannot directly write to your local "
+                f"filesystem. Every plot tool will:\n"
+                f"  1. Return the image inline (renders in chat — right-click "
+                f"to Save As, which typically goes to your Downloads folder).\n"
+                f"  2. Include a short save hint pointing at `{cleaned}`.\n"
+                f"  3. Make the plot retrievable via `get_save_script("
+                f"filename=...)`, which returns a self-contained Python "
+                f"script that writes the plot to `{cleaned}` on your machine "
+                f"when run with `python save_plot.py`.\n\n"
+                f"Tables produced by the data tools (find_differentially_*, "
+                f"find_common_*, get_study_info) are also returned with their "
+                f"CSV text inline in the response, so you can copy-paste or "
+                f"have your LLM client save them locally."
+            )
+        else:
+            advisory = (
+                "\n\nThe server is running locally (stdio transport), so it "
+                "will write files directly to that path. Each plot tool will "
+                "also return the image inline so you can view it immediately "
+                "in the chat."
+            )
+
+        return [types.TextContent(
+            type="text",
+            text=(
+                f"Output directory set to: `{cleaned}`\n"
+                f"Files generated by this session will be saved there." + advisory
+            ),
+        )]
+
+    @mcp.tool(
+        annotations={
+            "title": "Get Output Directory",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
+    async def get_output_directory() -> list[types.TextContent]:
+        """Return the currently-configured output directory for this session.
+
+        Returns the path previously set by set_output_directory, or a note
+        explaining that no path has been set yet (and how to set one).
+        """
+        current = _get_user_output_dir()
+        if current:
+            return [types.TextContent(
+                type="text",
+                text=f"Current output directory: `{current}`",
+            )]
+        return [types.TextContent(
+            type="text",
+            text=(
+                "No output directory has been set for this session. "
+                "Call `set_output_directory(path='...')` with the absolute "
+                "path on your local machine where you want generated files "
+                "(volcano plots, Venn diagrams, CSVs) to be saved."
+            ),
+        )]
+
+    @mcp.tool(
+        annotations={
+            "title": "Get Save Script for a Plot",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
+    async def get_save_script(
+        filename: Optional[str] = Field(
+            None,
+            description=(
+                "Suggested filename of a recently generated plot (e.g. "
+                "'volcano_plot_OSD-244_expression_30_days_vs_60_days.png'). "
+                "Look at the most recent create_volcano_plot or "
+                "create_venn_diagram response — the filename appears in the "
+                "'Save' block. Omit this parameter to list the filenames of "
+                "all plots currently available in the registry."
+            ),
+        ),
+    ) -> list[types.TextContent]:
+        """Return guidance for saving a previously generated plot to the
+        user's local filesystem.
+
+        WHEN TO USE THIS TOOL:
+        Call this only when the user explicitly asks for save guidance for a
+        specific plot — for example, "how do I save the volcano plot to my
+        Downloads folder?" or "I can't right-click — give me another way to
+        save the plot." By default plot tools (create_volcano_plot,
+        create_venn_diagram) return only a SHORT save hint to keep response
+        sizes manageable. The detailed save options are delivered on demand
+        via this tool, so they don't burn conversation context unless the
+        user actually wants them.
+
+        HOW IT WORKS:
+        Each plot tool registers the PNG bytes of the plot it generated in
+        a per-session registry (up to the last 8 plots; older entries are
+        evicted FIFO). Calling this tool with the plot's suggested filename
+        returns a markdown block with three save options:
+
+          - Option A (right-click save on the inline image)
+          - Option B (ask your LLM client to save via filesystem access,
+            optionally re-fetching the canonical bytes through fetch_plot
+            or the plot:// resource if the inline image was corrupted)
+          - Option C (fetch the canonical PNG bytes via resources/read on
+            the plot:// URI for clients that support MCP resources)
+
+        The response itself contains no PNG bytes — only references to the
+        plot:// resource URI and the fetch_plot tool, both of which deliver
+        the bytes through a separate request.
+
+        LISTING AVAILABLE PLOTS:
+        Call this tool with no `filename` argument to list the filenames
+        of all plots currently held in the registry. Useful when the user
+        asks for save guidance but doesn't remember which plot they want.
+        """
+        # Listing mode: no filename → return the catalogue.
+        if not filename or not filename.strip():
+            available = _list_registered_plots()
+            if not available:
+                return [types.TextContent(
+                    type="text",
+                    text=(
+                        "No plots are currently available for save-script "
+                        "retrieval in this session. Generate a plot first "
+                        "(create_volcano_plot or create_venn_diagram) and "
+                        "then call this tool again with the plot's filename."
+                    ),
+                )]
+            bullets = "\n".join(f"  - `{f}`" for f in available)
+            return [types.TextContent(
+                type="text",
+                text=(
+                    f"Plots currently available for save-script retrieval "
+                    f"(call `get_save_script(filename=...)` to receive the "
+                    f"Python save script for any of these):\n\n{bullets}"
+                ),
+            )]
+
+        # Lookup mode: caller specified a filename. Resolve from the registry.
+        looked_up = _lookup_plot(filename.strip())
+        if looked_up is None:
+            available = _list_registered_plots()
+            if not available:
+                hint = (
+                    "No plots are currently in the registry. Generate one "
+                    "first (create_volcano_plot or create_venn_diagram)."
+                )
+            else:
+                bullets = "\n".join(f"  - `{f}`" for f in available)
+                hint = (
+                    f"Available filenames:\n\n{bullets}\n\n"
+                    f"If the plot you want isn't listed, it may have been "
+                    f"evicted from the registry (only the last "
+                    f"{MAX_LAST_PLOTS} plots are retained). Regenerate the "
+                    f"plot and try again."
+                )
+            return [types.TextContent(
+                type="text",
+                text=(
+                    f"No plot named `{filename}` is in the registry.\n\n"
+                    f"{hint}"
+                ),
+            )]
+
+        png_bytes, user_facing_path = looked_up
+        # The save instructions now reference the canonical plot:// resource
+        # URI rather than embedding the base64 payload inline. This keeps the
+        # response small (~1 KB regardless of PNG size) and gives the client
+        # a retry-safe path to the bytes via resources/read or fetch_plot.
+        return [types.TextContent(
+            type="text",
+            text=_make_save_instructions(user_facing_path, filename, len(png_bytes)),
+            mimeType="text/markdown",
+        )]
+
+    @mcp.tool(
+        annotations={
+            "title": "Cypher Query (fallback only)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def query(
         query: str = Field(..., description="The Cypher query to execute."),
         params: Optional[dict[str, Any]] = Field(
             None, description="The parameters to pass to the Cypher query."
         ),
     ) -> list[types.TextContent]:
-        """Execute a Cypher query on the Neo4j database. 
+        """FALLBACK Cypher executor. Use this ONLY when no specialist tool covers the question.
 
-        If the question is about up- or down-regulated genes, use the find_differentially_expressed_genes tool.
-        If the question is about hyper- or hypo-methylated regions, use the find_differentially_methylated_regions tool.
-        If the question is about differentially abundant organisms, use the find_differentially_abundant_organisms tool.
-        If the question is about a study and its assays, use the get_study_info tool.
+        DO NOT call this tool when the question matches one of these patterns —
+        call the named tool instead, EVEN IF you think Cypher would be more flexible:
+
+          - "up/down-regulated genes", "DEGs", "differential expression",
+            "log2fc rankings", "top N up/downregulated genes for assay X"
+                → find_differentially_expressed_genes(assay_id=...)
+          - "hyper/hypo-methylated regions", "DMRs", "methylation_diff",
+            "hypermethylated promoter regions", "all DMRs passing q<0.05",
+            pooling methylation across replicate assays
+                → find_differentially_methylated_regions(assay_id=...)
+          - "differentially abundant organisms", DESeq2/ANCOM-BC abundance,
+            "increased/decreased abundance for assay X"
+                → find_differentially_abundant_organisms(assay_id=...)
+          - study metadata, what assays a study has, study factors/materials,
+            project title, description, host organism/strain
+                → get_study_info(study_id=...)
+          - factor-pair → assay-id resolution (e.g. "give me the assay for
+            Space Flight,Carcass vs Ground Control,Carcass in OSD-48")
+                → select_assays(study_id=..., selection=...)
+          - common DEGs/DMRs/DA organisms across multiple assays, intersections
+                → find_common_differentially_expressed_genes(assay_ids=[...])
+                → find_common_differentially_methylated_regions(assay_ids=[...])
+                → find_common_differentially_abundant_organisms(assay_ids=[...])
+          - DE genes overlapping DM regions, expression-methylation coupling,
+            classical epigenetic silencing analysis
+                → find_common_de_genes_overlapping_dm_regions(...)
+          - listing nodes / properties / relationships in the KG
+                → get_neo4j_schema(), get_node_metadata(), get_relationship_metadata()
+
+        If you only have a study identifier and need assay IDs, call
+        `select_assays` or `get_study_info` FIRST; do not write Cypher to
+        discover assay IDs.
+
+        The specialist tools return formatted markdown tables AND an inline CSV
+        side-channel that this `query` tool does not produce. Falling back to
+        `query` for the categories above also loses the parallel multi-query
+        execution, the method-aware significance filtering (DESeq2 adj_p_value
+        vs. ANCOM-BC q_value), the region-vs-gene aggregation, and the
+        MethylationRegion location filter plumbing the specialists already
+        implement correctly.
+
+        Only call this tool for ad-hoc Cypher that the specialist tools cannot
+        express: schema exploration, custom multi-hop traversals, exotic
+        aggregations, or one-off counts the specialists don't expose.
 
         OUTPUT FORMAT - CRITICAL:
         The response begins with a `total_rows: N` header followed by `rows:` and then the
@@ -288,7 +1126,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 types.TextContent(type="text", text=f"Error: {e}\n{query}\n{params}")
             ]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Get Node Metadata",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def get_node_metadata() -> list[types.TextContent]:
         """Get metadata for all nodes from MetaNode nodes in the knowledge graph."""
 
@@ -313,7 +1158,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Get Relationship Metadata",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def get_relationship_metadata() -> list[types.TextContent]:
         """Get descriptions of properties of all relationships in the knowledge graph."""
 
@@ -376,20 +1228,34 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             logger.error(f"Database error retrieving relationship metadata: {e}")
             return [types.TextContent(type="text", text=f"Error: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Get Study Info (metadata + assay inventory)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def get_study_info(
         study_id: str = Field(..., description="Study identifier (e.g., 'OSD-267')")
     ) -> list[types.TextContent]:
-        """Return detailed information about a study, including its assays with their technology and measurement types.
-        
+        """USE THIS TOOL (not the `query` tool) for any study-metadata question:
+        "what assays does study X have", "tell me about OSD-267", project title,
+        description, host organism, missions, factor space, or any inventory of
+        a study's assays. Falling back to `query` for these reproduces the work
+        this tool already does and loses the formatted markdown + inline CSV
+        side-channel.
+
+        Return detailed information about a study, including its assays with their technology and measurement types.
+
         This tool queries the GeneLab KG for:
           1) Study metadata (name, project title, description, organism, etc.)
           2) All assays for the study with their technology, measurement type, differential analysis method,
              factors, and materials
           3) Associated missions
-        
+
         For example, OSD-267 should return that it has both 16S and ITS amplicon sequencing data.
-        
+
         """
         
         study_cypher = """
@@ -518,9 +1384,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 csv_path, csv_link = _write_results_csv(
                     csv_rows, f"study_{study_id}_assays"
                 )
+                csv_text = _render_csv_text(csv_rows)
                 lines.append(_canonical_block(
                     assay_table_md, csv_path, csv_link,
-                    context_label=f"assays for {study_id}"
+                    context_label=f"assays for {study_id}",
+                    csv_text=csv_text,
                 ))
             else:
                 lines.append("*No assays found for this study.*")
@@ -533,32 +1401,55 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             logger.error(f"Error in get_study_info: {e}")
             return [types.TextContent(type="text", text=f"Error in get_study_info: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Select Assays (factor pair → assay IDs)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def select_assays(
         study_id: Optional[str] = None,
         selection: Optional[str] = None
     ) -> list[types.Content]:
-        """List and select assays for a study and render the response in markdown format.
-        
+        """USE THIS TOOL (not the `query` tool) to resolve a factor-pair condition
+        (e.g. "Space Flight,Carcass vs Ground Control,Carcass") into the
+        matching assay identifier(s) for a study. Falling back to `query` for
+        this category loses the numbered factor menu, the per-match
+        technology/measurement/method columns, and the next-step suggestions
+        this tool emits.
+
+        List and select assays for a study and render the response in markdown format.
+
         First call (selection=None):
         - If study_id missing, prompt for one (e.g., 'OSD-253').
         - Build a list of unique factor arrays across all assays.
-        - Return a numbered menu as a markdown table!
-        
+        - Return a numbered menu as a markdown table.
+
         Second call (selection='i,j,k,l,...,m,n'):
         - Pairs consecutive indices: (i,j), (k,l), ..., (m,n)
-        - Returns assay_id(s) for each pair comparison
         - Must provide an even number of indices
-        
+        - For each pair, returns the matching assay(s) with technology,
+          measurement, differential analysis method, and material columns
+          so the assistant can pick the right assay for a downstream
+          question (e.g., RNA-Seq for DE genes, WGBS for DM regions,
+          amplicon for organism abundance) WITHOUT issuing a follow-up
+          Cypher query.
         """
         if not study_id:
             return [types.TextContent(type="text", text="Please provide a study_id (e.g., OSD-253).")]
 
         cypher = """
         MATCH (s:Study {identifier: $study_id})-[:PERFORMED_SpAS]->(a:Assay)
-        RETURN a.identifier AS assay_id,
-               coalesce(a.factors_1, []) AS f1,
-               coalesce(a.factors_2, []) AS f2
+        RETURN a.identifier                    AS assay_id,
+               coalesce(a.factors_1, [])       AS f1,
+               coalesce(a.factors_2, [])       AS f2,
+               a.technology                    AS technology,
+               a.measurement                   AS measurement,
+               a.differential_analysis_method  AS method,
+               a.material_name_1               AS material_1,
+               a.material_name_2               AS material_2
         ORDER BY assay_id
         """
 
@@ -642,44 +1533,76 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             array2 = unique_arrays[idx2 - 1]
             key1 = tuple(array1)
             key2 = tuple(array2)
-            
-            # Find matching assay
-            match_ids = set()
+
+            # Find matching assays. We collect the full row record so we can
+            # surface technology / measurement / method per match — this is
+            # what the assistant needs to pick the right assay for an
+            # expression vs. methylation vs. abundance question without
+            # having to issue a follow-up Cypher query.
+            matches: list[dict] = []
+            seen_ids: set = set()
             for r in rows:
                 f1 = normalize(r.get("f1"))
                 f2 = normalize(r.get("f2"))
-                # Check both orderings: (array1, array2) or (array2, array1)
-                #if (tuple(f1) == key1 and tuple(f2) == key2) or \
-                #   (tuple(f1) == key2 and tuple(f2) == key1):
                 if (tuple(f1) == key1 and tuple(f2) == key2):
-                    match_ids.add(r.get("assay_id"))
-                    # break  # TODO Keep first match only (eliminate duplicate assays)
-            
+                    aid = r.get("assay_id")
+                    if aid not in seen_ids:
+                        seen_ids.add(aid)
+                        matches.append({
+                            "assay_id": aid,
+                            "technology": r.get("technology"),
+                            "measurement": r.get("measurement"),
+                            "method": r.get("method"),
+                            "material_1": r.get("material_1"),
+                            "material_2": r.get("material_2"),
+                        })
+
             comparisons.append({
                 "pair_number": pair_idx,
                 "index1": idx1,
                 "array1": array1,
                 "index2": idx2,
                 "array2": array2,
-                "assay_ids": sorted(match_ids),
-                "selected_assay_id": next(iter(match_ids)) if len(match_ids) == 1 else None
+                "matches": matches,
+                "selected_assay_id": matches[0]["assay_id"] if len(matches) == 1 else None,
             })
-        
+
         # Build response
         lines = []
         lines.append(f"## Selected Assays for {study_id}\n")
-        
+
         for comp in comparisons:
             lines.append(f"### Pair {comp['pair_number']}: Index {comp['index1']} vs Index {comp['index2']}")
             lines.append(f"**Condition 1 (Index {comp['index1']}):** {_fmt(comp['array1'])}")
             lines.append(f"**Condition 2 (Index {comp['index2']}):** {_fmt(comp['array2'])}")
-            
-            if comp['selected_assay_id']:
-                lines.append(f"**Assay ID:** `{comp['selected_assay_id']}`")
-            elif len(comp['assay_ids']) == 0:
+
+            if not comp['matches']:
                 lines.append("**Status:** No matching assay found")
+            elif len(comp['matches']) == 1:
+                m = comp['matches'][0]
+                lines.append(f"**Assay ID:** `{m['assay_id']}`")
+                meta_bits = []
+                if m.get('technology'):  meta_bits.append(f"technology: {m['technology']}")
+                if m.get('measurement'): meta_bits.append(f"measurement: {m['measurement']}")
+                if m.get('method'):      meta_bits.append(f"method: {m['method']}")
+                if meta_bits:
+                    lines.append("**Assay metadata:** " + "; ".join(meta_bits))
             else:
-                lines.append(f"**Status:** Multiple matches: {', '.join(comp['assay_ids'])}")
+                # Multiple matches — render a markdown table so the
+                # assistant (and the user) can pick the right assay by
+                # technology/measurement without a follow-up Cypher query.
+                lines.append(f"**Status:** {len(comp['matches'])} matching assays — pick by technology / measurement:\n")
+                lines.append("| Assay ID | Technology | Measurement | Method | Material 1 | Material 2 |")
+                lines.append("|----------|------------|-------------|--------|------------|------------|")
+                for m in comp['matches']:
+                    lines.append(
+                        f"| `{m['assay_id']}` | "
+                        f"{m.get('technology') or 'N/A'} | "
+                        f"{m.get('measurement') or 'N/A'} | "
+                        f"{m.get('method') or 'N/A'} | "
+                        f"{m.get('material_1') or 'N/A'} | "
+                        f"{m.get('material_2') or 'N/A'} |"
+                    )
             lines.append("")
         
         # Add suggested next steps
@@ -704,21 +1627,52 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             types.TextContent(type="text", text="\n".join(lines), mimeType="text/markdown"),
         ]
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Find Differentially Expressed Genes (single assay)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def find_differentially_expressed_genes(
         assay_id: str = Field(..., description="Assay identifier (e.g., 'OSD-253-6c5f9f37b9cb2ebeb2743875af4bdc86')"),
-        top_n: int = Field(10, description="How many genes to display for each of up- and down-regulated lists"),
+        top_n: Optional[int] = Field(
+            10,
+            description=(
+                "How many genes to display for each of up- and down-regulated "
+                "lists. Pass None (or omit) to return ALL genes passing the "
+                "adj_p_value filter rather than a top-N — useful when the user "
+                "asks for 'all significantly upregulated genes' or wants the "
+                "complete filtered set as CSV. When the full set is large, the "
+                "CSV contains every row passing the filter."
+            ),
+        ),
         adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for significance (default: 0.05). Only genes with adj_p_value <= this value are returned.")
     ) -> list[types.TextContent]:
-        """Return the top-N up- and down-regulated genes for a given assay_id.
-    
+        """USE THIS TOOL (not the `query` tool) for any "up/down-regulated genes",
+        "DEGs", or "differential expression" question for a single assay.
+
+        The `query` tool can express the same Cypher, but using it for this
+        category loses the formatted markdown tables, the inline CSV
+        side-channel, the proper adj_p_value handling, and the parallel
+        execution of the count queries this tool already provides correctly.
+
+        Return the top-N up- and down-regulated genes for a given assay_id.
+
         This tool runs two queries on the GeneLab KG:
           1) Top-N upregulated genes (log2fc > 0, adj_p_value <= adj_p_threshold, highest log2fc first)
           2) Top-N downregulated genes (log2fc < 0, adj_p_value <= adj_p_threshold, lowest log2fc first)
-        
+
+        Returning all passing rows:
+          Pass `top_n=None` to return ALL rows that pass the filters rather
+          than a top-N ranking. Use this when the user asks for "all
+          significantly up/downregulated genes" or wants the complete
+          filtered set as CSV.
+
         Results include gene symbol, gene name, log2 fold change, adjusted p-value,
         and group means and standard deviations for each condition.
-        
+
         """
 
         factors_cypher = """
@@ -726,8 +1680,15 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         RETURN a.factors_1 AS factors_1, a.factors_2 AS factors_2
         """
 
-        up_cypher = """
-        MATCH (a:Assay {identifier: $assay_id})
+        # Conditionally include LIMIT only when top_n is a positive integer.
+        # Neo4j does not accept LIMIT NULL, so when the caller wants ALL rows
+        # we drop the clause entirely. This matches the find_differentially_methylated_regions
+        # behavior and is what makes top_n=None produce the full filtered set
+        # in one Cypher call.
+        limit_clause = "\n        LIMIT $top_n" if top_n is not None else ""
+
+        up_cypher = f"""
+        MATCH (a:Assay {{identifier: $assay_id}})
               -[r:MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG]->
               (mg:MGene)
         WHERE r.log2fc > 0 AND r.adj_p_value IS NOT NULL AND r.adj_p_value <= $adj_p_threshold
@@ -740,12 +1701,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
           r.group_stdev_1    AS group_stdev_1,
           r.group_mean_2     AS group_mean_2,
           r.group_stdev_2    AS group_stdev_2
-        ORDER BY r.log2fc DESC
-        LIMIT $top_n
+        ORDER BY r.log2fc DESC{limit_clause}
         """
-    
-        down_cypher = """
-        MATCH (a:Assay {identifier: $assay_id})
+
+        down_cypher = f"""
+        MATCH (a:Assay {{identifier: $assay_id}})
               -[r:MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG]->
               (mg:MGene)
         WHERE r.log2fc < 0 AND r.adj_p_value IS NOT NULL AND r.adj_p_value <= $adj_p_threshold
@@ -758,8 +1718,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
           r.group_stdev_1    AS group_stdev_1,
           r.group_mean_2     AS group_mean_2,
           r.group_stdev_2    AS group_stdev_2
-        ORDER BY r.log2fc ASC
-        LIMIT $top_n
+        ORDER BY r.log2fc ASC{limit_clause}
         """
 
         count_up_cypher = """
@@ -786,7 +1745,13 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     return await s.execute_read(_read, cypher, params)
 
             factors_params = {"assay_id": assay_id}
-            up_params = {"assay_id": assay_id, "top_n": top_n, "adj_p_threshold": adj_p_threshold}
+            # top_n is only referenced by Cypher when limit_clause is non-empty.
+            # Include it in params only when the query actually uses it; Neo4j
+            # tolerates extra params but keeping the two paired makes the code
+            # clearer and parallels the methylation tool's behavior.
+            up_params = {"assay_id": assay_id, "adj_p_threshold": adj_p_threshold}
+            if top_n is not None:
+                up_params["top_n"] = top_n
             down_params = up_params  # identical
             count_params = {"assay_id": assay_id, "adj_p_threshold": adj_p_threshold}
 
@@ -848,9 +1813,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             up_csv_path, up_csv_link = _write_results_csv(
                 up, f"de_genes_up_{assay_id}_top{top_n}_p{adj_p_threshold}"
             )
+            up_csv_text = _render_csv_text(up)
             human_lines.append(_canonical_block(
                 up_table_md, up_csv_path, up_csv_link,
-                context_label="upregulated genes table"
+                context_label="upregulated genes table",
+                csv_text=up_csv_text,
             ))
             human_lines.append("")
 
@@ -859,9 +1826,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             down_csv_path, down_csv_link = _write_results_csv(
                 down, f"de_genes_down_{assay_id}_top{top_n}_p{adj_p_threshold}"
             )
+            down_csv_text = _render_csv_text(down)
             human_lines.append(_canonical_block(
                 down_table_md, down_csv_path, down_csv_link,
-                context_label="downregulated genes table"
+                context_label="downregulated genes table",
+                csv_text=down_csv_text,
             ))
 
             return [
@@ -872,35 +1841,210 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             logger.error(f"Error in find_differentially_expressed_genes: {e}")
             return [types.TextContent(type="text", text=f"Error in find_differentially_expressed_genes: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Find Differentially Methylated Regions (pool-aware)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def find_differentially_methylated_regions(
-        assay_id: str = Field(..., description="Assay identifier (e.g., 'OSD-48-abc123')"),
-        top_n: int = Field(10, description="How many regions to display for each of hyper- and hypo-methylated lists"),
-        q_value_threshold: float = Field(0.05, description="q-value threshold for significance (default: 0.05). Only regions with q_value <= this value are returned.")
+        assay_id: "str | list[str]" = Field(
+            ...,
+            description=(
+                "Assay identifier, or a list of assay identifiers to pool. "
+                "Pass a single string (e.g. 'OSD-48-968c...') to query one "
+                "assay. Pass a list (e.g. ['OSD-48-968c...', 'OSD-48-4dc1...']) "
+                "to pool results across multiple methylation assays — useful "
+                "when a study has independent replicate methylation assays "
+                "with identical factor spaces and you want the combined "
+                "evidence. The output table will have an additional "
+                "'assay_id' column so each row's source is identifiable, "
+                "and the same region significantly methylated in two pooled "
+                "assays will appear as two rows."
+            ),
+        ),
+        top_n: Optional[int] = Field(
+            10,
+            description=(
+                "How many regions to display for each of hyper- and hypo-methylated "
+                "lists. Pass None (or omit) to return ALL rows passing the filters "
+                "rather than a top-N — useful when the user asks for 'all "
+                "hypermethylated promoter regions' or wants to download the "
+                "complete filtered set as CSV. When the full set is large "
+                "(>100 rows), the inline markdown table is capped at the "
+                "first 100 rows for readability while the CSV contains every "
+                "row."
+            ),
+        ),
+        q_value_threshold: float = Field(0.05, description="q-value threshold for significance (default: 0.05). Only regions with q_value <= this value are returned."),
+        methylation_diff_threshold: float = Field(
+            0.0,
+            description=(
+                "Minimum |methylation_diff| magnitude (in percentage points) "
+                "required for a row to be kept (default: 0.0 = any change). "
+                "Hypermethylated rows must have methylation_diff > "
+                "methylation_diff_threshold; hypomethylated rows must have "
+                "methylation_diff < -methylation_diff_threshold. The "
+                "GeneLab KG stores methylation_diff as a raw percentage, so "
+                "a threshold of 10 means '10 percentage points or more', "
+                "matching typical methylKit reporting conventions."
+            ),
+        ),
+        in_promoter: Optional[bool] = Field(
+            None,
+            description=(
+                "MethylationRegion location filter. When True, return only regions "
+                "overlapping a gene promoter (mr.in_promoter = true). When False, "
+                "exclude promoter-overlapping regions (mr.in_promoter = false). None "
+                "(default) imposes no promoter filter. The filter is applied during "
+                "the Cypher query, so 'top_n' and the 'showing N of TOTAL' count "
+                "both reflect the filtered set — promoter-only top-N rankings are "
+                "computed from the promoter-only universe, NOT post-filtered from "
+                "the global top-N."
+            ),
+        ),
+        in_exon: Optional[bool] = Field(
+            None,
+            description=(
+                "MethylationRegion location filter. When True, return only regions "
+                "overlapping an exon (mr.in_exon = true). When False, exclude "
+                "exon-overlapping regions. None (default) imposes no exon filter. "
+                "Combines with other filters via AND."
+            ),
+        ),
+        in_intron: Optional[bool] = Field(
+            None,
+            description=(
+                "MethylationRegion location filter. When True, return only regions "
+                "overlapping an intron (mr.in_intron = true). When False, exclude "
+                "intron-overlapping regions. None (default) imposes no intron "
+                "filter. Combines with other filters via AND."
+            ),
+        ),
+        dist_to_feature_max: Optional[int] = Field(
+            None,
+            description=(
+                "MethylationRegion distance filter. When set, return only regions "
+                "whose dist_to_feature (bp to the nearest annotated gene feature) "
+                "is <= this value. None (default) imposes no distance filter. "
+                "Useful for narrowing to regions tightly associated with gene bodies."
+            ),
+        ),
     ) -> list[types.TextContent]:
-        """Return the top-N hyper- and hypo-methylated regions for a given assay_id.
-    
+        """USE THIS TOOL (not the `query` tool) for any "hyper/hypo-methylated
+        regions", "DMRs", or "differential methylation" question — including
+        all-rows requests, promoter/exon/intron-filtered methylation queries,
+        and pooling methylation across replicate assays. Falling back to `query`
+        for this category reproduces the work this tool already does (proper
+        IS-NOT-NULL guards, gene-symbol join, parallel count queries, location
+        filtering, deterministic CSV emission) and loses the formatted markdown
+        + inline CSV side-channel.
+
+        Return hyper- and hypo-methylated regions for one or more assays.
+
         This tool runs two queries on the GeneLab KG:
-          1) Top-N hypermethylated regions (methylation_diff > 0, q_value <= q_value_threshold, highest first)
-          2) Top-N hypomethylated regions (methylation_diff < 0, q_value <= q_value_threshold, lowest first)
-        
-        Results include gene symbol, gene name, region, in_promoter flag,
-        methylation difference, q-value, and group means and standard deviations.
-        
+          1) Hypermethylated regions (methylation_diff > methylation_diff_threshold,
+             q_value <= q_value_threshold, highest first)
+          2) Hypomethylated regions  (methylation_diff < -methylation_diff_threshold,
+             q_value <= q_value_threshold, lowest first)
+
+        Pooling across assays:
+          Pass a list to `assay_id` to pool results across multiple methylation
+          assays (the Cypher uses `a.identifier IN $assay_ids`). Common use case:
+          a study has 2+ methylation assays representing replicate runs of the
+          same comparison, and the user wants the combined evidence rather than
+          per-assay tables. The output adds an `assay_id` column so each row's
+          source is visible.
+
+        Returning all passing rows:
+          Pass `top_n=None` to return ALL rows that pass the filters rather
+          than a top-N ranking. Use this when the user asks for "all
+          hypermethylated promoter regions" or wants the complete filtered
+          set as CSV. To keep the response readable when the full set is
+          large, the inline markdown table is capped at the first 100 rows
+          and a note is shown; the CSV contains every row.
+
+        MethylationRegion location filters (in_promoter, in_exon, in_intron,
+        dist_to_feature_max) are applied DURING the Cypher query. This means
+        when a user asks for "top hypermethylated regions in the promoter",
+        pass in_promoter=True and the tool will correctly rank within the
+        promoter universe. Do NOT post-filter the unfiltered top-N — that
+        produces wrong results because regions outside the filter (e.g.
+        non-promoter regions) occupy slots in the unfiltered top-N and
+        displace correctly-ranked filtered regions. Multiple filters combine
+        with AND, so in_promoter=True with in_intron=False returns promoter
+        regions that are not intronic.
+
+        WHEN TO USE THIS TOOL vs. direct Cypher via the `query` tool:
+        Use THIS tool for any "hyper/hypo methylated regions" question,
+        including pooled-across-assays, all-passing-rows, and filter-by-location
+        variants. It produces formatted markdown tables AND an inline CSV
+        that the user can save directly. Falling back to direct Cypher loses
+        the formatted output and the CSV.
         """
 
+        # Normalize assay_id to a list so the pooled and single-assay paths
+        # share a single implementation. The Cypher always uses
+        # `WHERE a.identifier IN $assay_ids` regardless of how many were passed.
+        if isinstance(assay_id, str):
+            assay_ids = [assay_id]
+        else:
+            assay_ids = list(assay_id)
+        if not assay_ids:
+            return [types.TextContent(
+                type="text",
+                text="Error: at least one assay_id must be provided.",
+            )]
+
+        # Build the MethylationRegion filter block. This is appended to every
+        # query's WHERE clause (top-N + count) so the "showing N of TOTAL"
+        # message reflects the filtered universe, not the global one. The
+        # parameter values are passed through the query params dict; only
+        # filters that are not None contribute clauses.
+        mr_filter_parts: list[str] = []
+        mr_filter_params: dict[str, Any] = {}
+        if in_promoter is not None:
+            mr_filter_parts.append("AND mr.in_promoter = $mr_in_promoter")
+            mr_filter_params["mr_in_promoter"] = in_promoter
+        if in_exon is not None:
+            mr_filter_parts.append("AND mr.in_exon = $mr_in_exon")
+            mr_filter_params["mr_in_exon"] = in_exon
+        if in_intron is not None:
+            mr_filter_parts.append("AND mr.in_intron = $mr_in_intron")
+            mr_filter_params["mr_in_intron"] = in_intron
+        if dist_to_feature_max is not None:
+            mr_filter_parts.append("AND mr.dist_to_feature IS NOT NULL AND mr.dist_to_feature <= $mr_dist_max")
+            mr_filter_params["mr_dist_max"] = dist_to_feature_max
+        mr_filter_block = ("\n          " + "\n          ".join(mr_filter_parts)) if mr_filter_parts else ""
+
+        # Conditionally include LIMIT only when top_n is a positive integer.
+        # Neo4j does not accept LIMIT NULL, so when the caller wants ALL rows
+        # we drop the clause entirely. This is what makes top_n=None produce
+        # the full filtered set in one Cypher call.
+        limit_clause = "\n        LIMIT $top_n" if top_n is not None else ""
+
+        # The factors query picks the first assay's labels — pooled assays in
+        # this tool's intended use case share the same factor space (which is
+        # why pooling makes sense at all). If they differ, the labels still
+        # come from a real assay in the set, which is better than an
+        # invented composite label.
         factors_cypher = """
-        MATCH (a:Assay {identifier: $assay_id})
+        MATCH (a:Assay {identifier: $first_assay_id})
         RETURN a.factors_1 AS factors_1, a.factors_2 AS factors_2
         """
 
-        hyper_cypher = """
-        MATCH (a:Assay {identifier: $assay_id})
+        hyper_cypher = f"""
+        MATCH (a:Assay)
               -[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->
               (mr:MethylationRegion)
               <-[:METHYLATED_IN_MGmMR]-(mg:MGene)
-        WHERE r.methylation_diff > 0 AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold
+        WHERE a.identifier IN $assay_ids
+          AND r.methylation_diff > $methylation_diff_threshold
+          AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold{mr_filter_block}
         RETURN
+          a.identifier         AS assay_id,
           mg.symbol            AS gene_symbol,
           mg.name              AS gene_name,
           mr.identifier        AS region,
@@ -911,17 +2055,19 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
           r.group_stdev_1      AS group_stdev_1,
           r.group_mean_2       AS group_mean_2,
           r.group_stdev_2      AS group_stdev_2
-        ORDER BY r.methylation_diff DESC
-        LIMIT $top_n
+        ORDER BY r.methylation_diff DESC{limit_clause}
         """
-    
-        hypo_cypher = """
-        MATCH (a:Assay {identifier: $assay_id})
+
+        hypo_cypher = f"""
+        MATCH (a:Assay)
               -[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->
               (mr:MethylationRegion)
               <-[:METHYLATED_IN_MGmMR]-(mg:MGene)
-        WHERE r.methylation_diff < 0 AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold
+        WHERE a.identifier IN $assay_ids
+          AND r.methylation_diff < -$methylation_diff_threshold
+          AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold{mr_filter_block}
         RETURN
+          a.identifier         AS assay_id,
           mg.symbol            AS gene_symbol,
           mg.name              AS gene_name,
           mr.identifier        AS region,
@@ -932,22 +2078,25 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
           r.group_stdev_1      AS group_stdev_1,
           r.group_mean_2       AS group_mean_2,
           r.group_stdev_2      AS group_stdev_2
-        ORDER BY r.methylation_diff ASC
-        LIMIT $top_n
+        ORDER BY r.methylation_diff ASC{limit_clause}
         """
 
-        count_hyper_cypher = """
-        MATCH (a:Assay {identifier: $assay_id})-[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->(mr:MethylationRegion)<-[:METHYLATED_IN_MGmMR]-(mg:MGene)
-        WHERE r.methylation_diff > 0 AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold
+        count_hyper_cypher = f"""
+        MATCH (a:Assay)-[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->(mr:MethylationRegion)<-[:METHYLATED_IN_MGmMR]-(mg:MGene)
+        WHERE a.identifier IN $assay_ids
+          AND r.methylation_diff > $methylation_diff_threshold
+          AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold{mr_filter_block}
         RETURN count(*) AS total
         """
 
-        count_hypo_cypher = """
-        MATCH (a:Assay {identifier: $assay_id})-[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->(mr:MethylationRegion)<-[:METHYLATED_IN_MGmMR]-(mg:MGene)
-        WHERE r.methylation_diff < 0 AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold
+        count_hypo_cypher = f"""
+        MATCH (a:Assay)-[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->(mr:MethylationRegion)<-[:METHYLATED_IN_MGmMR]-(mg:MGene)
+        WHERE a.identifier IN $assay_ids
+          AND r.methylation_diff < -$methylation_diff_threshold
+          AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold{mr_filter_block}
         RETURN count(*) AS total
         """
-    
+
         try:
 
             # Run the 5 independent reads concurrently (see find_differentially_expressed_genes
@@ -956,9 +2105,24 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 async with neo4j_driver.session(database=database, default_access_mode=READ_ACCESS) as s:
                     return await s.execute_read(_read, cypher, params)
 
-            factors_params = {"assay_id": assay_id}
-            top_params = {"assay_id": assay_id, "top_n": top_n, "q_value_threshold": q_value_threshold}
-            count_params = {"assay_id": assay_id, "q_value_threshold": q_value_threshold}
+            factors_params = {"first_assay_id": assay_ids[0]}
+            # Shared params for the top-N row queries. top_n is only included
+            # when the caller specified a limit; otherwise the LIMIT clause
+            # was dropped and the parameter is unused.
+            top_params: dict[str, Any] = {
+                "assay_ids": assay_ids,
+                "q_value_threshold": q_value_threshold,
+                "methylation_diff_threshold": methylation_diff_threshold,
+                **mr_filter_params,
+            }
+            if top_n is not None:
+                top_params["top_n"] = top_n
+            count_params = {
+                "assay_ids": assay_ids,
+                "q_value_threshold": q_value_threshold,
+                "methylation_diff_threshold": methylation_diff_threshold,
+                **mr_filter_params,
+            }
 
             (factors_json_str, hyper_json_str, hypo_json_str,
              count_hyper_str, count_hypo_str) = await asyncio.gather(
@@ -985,19 +2149,53 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             else:
                 group1_label = "Group 1"
                 group2_label = "Group 2"
-    
+
+            # Display cap for the inline markdown table. The full CSV always
+            # contains every returned row; this only affects what's rendered
+            # as a markdown table for in-conversation reading. Past ~100 rows
+            # the table becomes unreadable and just consumes context. Users
+            # who need to inspect the full set use the CSV.
+            MARKDOWN_TABLE_CAP = 100
+
+            # When pooling multiple assays the assay_id column is the only
+            # way to tell rows apart, so we include it. For single-assay
+            # queries the column would just be the same value on every row —
+            # we omit it to match the simpler GitHub-baseline display.
+            show_assay_id_col = len(assay_ids) > 1
+
             def _fmt_meth_table(rows, title, total_count):
                 if not rows:
                     return f"## **{title}**\nNo significantly {title.lower()} regions were found.\n"
-                lines = [
-                    f"## **{title}** (showing {len(rows)} of {total_count} total)\n",
-                    f"| Gene | Gene Name | Region | In Promoter | Methylation Diff (%) | q-value | Mean ({group1_label}) | SD ({group1_label}) | Mean ({group2_label}) | SD ({group2_label}) |",
-                    "|------|-----------|--------|-------------|----------------------|---------|" + "------------|" * 4
+                # Apply the markdown-display cap. The CSV (built separately
+                # below) always uses the full row list.
+                display_rows = rows[:MARKDOWN_TABLE_CAP]
+                capped = len(rows) > MARKDOWN_TABLE_CAP
+
+                header_cols = ["Gene", "Gene Name", "Region"]
+                if show_assay_id_col:
+                    header_cols.insert(0, "Assay")
+                header_cols += [
+                    "In Promoter", "Methylation Diff (%)", "q-value",
+                    f"Mean ({group1_label})", f"SD ({group1_label})",
+                    f"Mean ({group2_label})", f"SD ({group2_label})",
                 ]
-                for r in rows:
+                header_line = "| " + " | ".join(header_cols) + " |"
+                sep_line = "|" + "|".join(["------"] * len(header_cols)) + "|"
+
+                if capped:
+                    heading = (
+                        f"## **{title}** (showing first {len(display_rows)} of "
+                        f"{total_count} total — full set in CSV below)\n"
+                    )
+                else:
+                    heading = f"## **{title}** (showing {len(display_rows)} of {total_count} total)\n"
+                lines = [heading, header_line, sep_line]
+
+                for r in display_rows:
                     gene = r.get('gene_symbol') or 'N/A'
                     name = r.get('gene_name') or 'N/A'
                     region = r.get('region', 'N/A')
+                    aid = r.get('assay_id', 'N/A')
                     in_prom = r.get('in_promoter')
                     in_prom_str = str(in_prom) if in_prom is not None else 'N/A'
                     md = r.get('methylation_diff')
@@ -1010,50 +2208,125 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     gs1_str = f"{gs1:.3f}" if gs1 is not None else 'N/A'
                     gm2_str = f"{gm2:.3f}" if gm2 is not None else 'N/A'
                     gs2_str = f"{gs2:.3f}" if gs2 is not None else 'N/A'
-                    lines.append(f"| **{gene}** | {name} | {region} | {in_prom_str} | {md_str} | {qv_str} | {gm1_str} | {gs1_str} | {gm2_str} | {gs2_str} |")
+
+                    cells = [f"**{gene}**", name, region]
+                    if show_assay_id_col:
+                        cells.insert(0, aid)
+                    cells += [in_prom_str, md_str, qv_str, gm1_str, gs1_str, gm2_str, gs2_str]
+                    lines.append("| " + " | ".join(cells) + " |")
                 return "\n".join(lines)
-    
-            human_lines = [
-                f"Top differentially methylated regions for assay: `{assay_id}`\n",
-            ]
+
+            # Header line: name the assay(s) so the response is self-describing
+            # even when pooled across multiple methylation assays.
+            if len(assay_ids) == 1:
+                header_line = f"Top differentially methylated regions for assay: `{assay_ids[0]}`\n"
+            else:
+                assay_list_md = ", ".join(f"`{a}`" for a in assay_ids)
+                header_line = f"Top differentially methylated regions pooled across {len(assay_ids)} assays: {assay_list_md}\n"
+            human_lines = [header_line]
+
+            # Reflect any active MR filters and the threshold/pool state in the
+            # suggested CSV filename so the saved file is self-describing — a
+            # user who downloads both an unfiltered and a promoter-only run from
+            # the same assay gets two distinct filenames, and pooled runs are
+            # clearly labeled as such.
+            filter_tag_parts: list[str] = []
+            if in_promoter is True:
+                filter_tag_parts.append("promoter")
+            elif in_promoter is False:
+                filter_tag_parts.append("nopromoter")
+            if in_exon is True:
+                filter_tag_parts.append("exon")
+            elif in_exon is False:
+                filter_tag_parts.append("noexon")
+            if in_intron is True:
+                filter_tag_parts.append("intron")
+            elif in_intron is False:
+                filter_tag_parts.append("nointron")
+            if dist_to_feature_max is not None:
+                filter_tag_parts.append(f"dist{dist_to_feature_max}")
+            if methylation_diff_threshold != 0.0:
+                filter_tag_parts.append(f"md{methylation_diff_threshold}")
+            filter_tag = ("_" + "_".join(filter_tag_parts)) if filter_tag_parts else ""
+
+            # Filename stem: use the single assay_id for non-pooled queries to
+            # match the prior naming; use a pooled tag for multi-assay queries.
+            if len(assay_ids) == 1:
+                stem_id = assay_ids[0]
+            else:
+                stem_id = f"pooled{len(assay_ids)}assays_{assay_ids[0]}"
+            top_n_tag = f"top{top_n}" if top_n is not None else "all"
 
             hyper_table_md = _fmt_meth_table(hyper, "Hypermethylated Regions", total_hyper)
             hyper_csv_path, hyper_csv_link = _write_results_csv(
-                hyper, f"dm_regions_hyper_{assay_id}_top{top_n}_q{q_value_threshold}"
+                hyper, f"dm_regions_hyper_{stem_id}_{top_n_tag}_q{q_value_threshold}{filter_tag}"
             )
+            hyper_csv_text = _render_csv_text(hyper)
             human_lines.append(_canonical_block(
                 hyper_table_md, hyper_csv_path, hyper_csv_link,
-                context_label="hypermethylated regions table"
+                context_label="hypermethylated regions table",
+                csv_text=hyper_csv_text,
             ))
             human_lines.append("")
 
             hypo_table_md = _fmt_meth_table(hypo, "Hypomethylated Regions", total_hypo)
             hypo_csv_path, hypo_csv_link = _write_results_csv(
-                hypo, f"dm_regions_hypo_{assay_id}_top{top_n}_q{q_value_threshold}"
+                hypo, f"dm_regions_hypo_{stem_id}_{top_n_tag}_q{q_value_threshold}{filter_tag}"
             )
+            hypo_csv_text = _render_csv_text(hypo)
             human_lines.append(_canonical_block(
                 hypo_table_md, hypo_csv_path, hypo_csv_link,
-                context_label="hypomethylated regions table"
+                context_label="hypomethylated regions table",
+                csv_text=hypo_csv_text,
             ))
 
             return [
                 types.TextContent(type="text", text="\n".join(human_lines), mimeType="text/markdown"),
             ]
-    
+
         except Exception as e:
             logger.error(f"Error in find_differentially_methylated_regions: {e}")
             return [types.TextContent(type="text", text=f"Error in find_differentially_methylated_regions: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Find Differentially Abundant Organisms (DESeq2/ANCOM-BC)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def find_differentially_abundant_organisms(
         assay_id: str = Field(..., description="Assay identifier (e.g., 'OSD-253-6c5f9f37b9cb2ebeb2743875af4bdc86')"),
-        top_n: int = Field(10, description="How many organisms to display for each of increased and decreased abundance lists"),
+        top_n: Optional[int] = Field(
+            10,
+            description=(
+                "How many organisms to display for each of increased and "
+                "decreased abundance lists. Pass None (or omit) to return ALL "
+                "organisms passing the magnitude + significance filters rather "
+                "than a top-N — useful when the user asks for 'all "
+                "significantly increased organisms' or wants the complete "
+                "filtered set as CSV. When the full set is large, the CSV "
+                "contains every row passing the filter."
+            ),
+        ),
         adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for DESeq2 abundance assays (default: 0.05). Applied to rows with adj_p_value populated."),
         q_value_threshold: float = Field(0.05, description="q-value threshold for ANCOM-BC abundance assays (default: 0.05). Applied to rows with q_value populated."),
         log2fc_threshold: float = Field(0.0, description="Minimum |log2fc| magnitude required for a row to be kept (default: 0.0 = any change). Applies to BOTH DESeq2 and ANCOM-BC rows since log2fc is populated for both methods."),
         lnfc_threshold: Optional[float] = Field(None, description="Optional minimum |lnfc| magnitude. Only applied to rows with lnfc populated (ANCOM-BC). DESeq2 rows are not filtered by this parameter. Leave unset (None) to skip lnfc filtering entirely.")
     ) -> list[types.TextContent]:
-        """Return the top-N organisms with increased and decreased differential abundance for a given assay_id.
+        """USE THIS TOOL (not the `query` tool) for any "differentially abundant
+        organisms", DESeq2/ANCOM-BC abundance, or "increased/decreased
+        abundance" question for a single assay.
+
+        The `query` tool can express the same Cypher, but using it for this
+        category loses the formatted markdown tables, the inline CSV
+        side-channel, the method-aware significance filtering (DESeq2
+        adj_p_value vs. ANCOM-BC q_value), and the safe lnfc handling that
+        avoids silently dropping DESeq2 rows (where lnfc IS NULL would fail a
+        naive `lnfc > 0` filter).
+
+        Return the top-N organisms with increased and decreased differential abundance for a given assay_id.
 
         Direction (increase vs. decrease) and ranking use log2fc, which is populated for
         BOTH DESeq2 and ANCOM-BC abundance edges in the GeneLab KG. log2fc is therefore
@@ -1061,9 +2334,9 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
         The lnfc property is only populated for ANCOM-BC edges (DESeq2 leaves it null).
         It is returned in the result for reference and can be used as an additional
-        magnitude filter via the lnfc_threshold parameter. Using lnfc as the direction
-        filter previously caused all DESeq2 rows to be silently dropped because Cypher's
-        null > 0 evaluates to null and fails the WHERE clause.
+        magnitude filter via the lnfc_threshold parameter. log2fc is the direction
+        filter because it is populated for both DESeq2 and ANCOM-BC rows; using lnfc
+        for direction would null-filter every DESeq2 row out of the result.
 
         Significance filtering is method-aware:
           - DESeq2 edges populate adj_p_value (not q_value); the adj_p_threshold applies.
@@ -1101,6 +2374,13 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 "          AND (r.lnfc IS NULL OR abs(r.lnfc) >= $lnfc_threshold)\n"
             )
 
+        # Conditionally include LIMIT only when top_n is a positive integer.
+        # Neo4j does not accept LIMIT NULL, so when the caller wants ALL rows
+        # we drop the clause entirely. This matches the methylation tool's
+        # behavior and is what makes top_n=None produce the full filtered set
+        # in one Cypher call.
+        limit_clause = "\n        LIMIT $top_n" if top_n is not None else ""
+
         up_cypher = f"""
         MATCH (a:Assay {{identifier: $assay_id}})
               -[r:MEASURED_DIFFERENTIAL_ABUNDANCE_ASmO]->
@@ -1121,8 +2401,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
           r.group_stdev_1    AS group_stdev_1,
           r.group_mean_2     AS group_mean_2,
           r.group_stdev_2    AS group_stdev_2
-        ORDER BY r.log2fc DESC
-        LIMIT $top_n
+        ORDER BY r.log2fc DESC{limit_clause}
         """
 
         down_cypher = f"""
@@ -1145,8 +2424,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
           r.group_stdev_1    AS group_stdev_1,
           r.group_mean_2     AS group_mean_2,
           r.group_stdev_2    AS group_stdev_2
-        ORDER BY r.log2fc ASC
-        LIMIT $top_n
+        ORDER BY r.log2fc ASC{limit_clause}
         """
 
         count_up_cypher = f"""
@@ -1191,11 +2469,18 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 async with neo4j_driver.session(database=database, default_access_mode=READ_ACCESS) as s:
                     return await s.execute_read(_read, cypher, params)
 
+            # top_n is only referenced when limit_clause is non-empty. Including it
+            # in params when LIMIT was dropped is harmless (Neo4j ignores unused
+            # params), but constructing it conditionally documents the contract.
+            row_params = dict(base_params)
+            if top_n is not None:
+                row_params["top_n"] = top_n
+
             (factors_json_str, up_json_str, down_json_str,
              count_up_str, count_down_str) = await asyncio.gather(
                 _run(factors_cypher, {"assay_id": assay_id}),
-                _run(up_cypher, {**base_params, "top_n": top_n}),
-                _run(down_cypher, {**base_params, "top_n": top_n}),
+                _run(up_cypher, row_params),
+                _run(down_cypher, row_params),
                 _run(count_up_cypher, base_params),
                 _run(count_down_cypher, base_params),
             )
@@ -1252,6 +2537,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             up_csv_path, up_csv_link = _write_results_csv(
                 up, f"da_orgs_up_{assay_id}_top{top_n}_p{adj_p_threshold}_q{q_value_threshold}"
             )
+            up_csv_text = _render_csv_text(up)
             human_lines.append(up_table_md)
             if up_csv_path:
                 human_lines.append(f"\n_CSV: `{up_csv_path}`_")
@@ -1261,6 +2547,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             down_csv_path, down_csv_link = _write_results_csv(
                 down, f"da_orgs_down_{assay_id}_top{top_n}_p{adj_p_threshold}_q{q_value_threshold}"
             )
+            down_csv_text = _render_csv_text(down)
             human_lines.append(down_table_md)
             if down_csv_path:
                 human_lines.append(f"\n_CSV: `{down_csv_path}`_")
@@ -1273,13 +2560,30 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             logger.error(f"Error in find_differentially_abundant_organisms: {e}")
             return [types.TextContent(type="text", text=f"Error in find_differentially_abundant_organisms: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Find Common Differentially Expressed Genes (across assays)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def find_common_differentially_expressed_genes(
             assay_ids: list[str] = Field(..., description="List of assay identifiers (e.g., ['OSD-253-abc123', 'OSD-253-def456'])"),
             log2fc_threshold: float = Field(1.0, description="Log2 fold change threshold for filtering genes (default: 1.0 = 2-fold change)"),
             adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for significance (default: 0.05, max value: 0.1)")
         ) -> list[types.TextContent]:
-            """Find common differentially expressed genes across multiple assays.
+            """USE THIS TOOL (not the `query` tool) for any "common DEGs across
+            assays", "genes upregulated in BOTH assays", "shared
+            up/downregulated genes", or any cross-assay DE intersection
+            question. Falling back to `query` for this category reproduces the
+            per-assay fetch + inner-join logic this tool already does correctly
+            (parallel fetches via the driver's connection pool, |log2fc| >
+            threshold filtering, separate up vs. down intersections) and loses
+            the formatted markdown tables, the inline CSV side-channel, and
+            the assay-reference legend.
+
+            Find common differentially expressed genes across multiple assays.
             
             This function:
             1. Takes a list of assay IDs as input (2 or more)
@@ -1322,12 +2626,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 ORDER BY m.log2fc ASC
                 """
 
-                # Fetch up/down gene sets for every assay concurrently. Previously
-                # this loop ran 2N sequential queries inside a single session;
-                # parallelizing them across the driver's connection pool collapses
-                # those 2N RTTs to ~1 RTT-equivalent. Each query opens its own
-                # session because Neo4j sessions aren't safe for concurrent
-                # transactions.
+                # Fetch up/down gene sets for every assay concurrently. Each
+                # query opens its own session because Neo4j sessions aren't safe
+                # for concurrent transactions; running them in parallel across
+                # the driver's connection pool collapses 2N sequential RTTs to
+                # ~1 RTT-equivalent.
                 async def _fetch(aid, cypher):
                     params = {
                         "assay_id": aid,
@@ -1401,9 +2704,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     up_csv_rows,
                     f"common_de_up_{'_'.join(a[:25] for a in assay_ids)}_l2fc{log2fc_threshold}_p{adj_p_threshold}"
                 )
+                up_csv_text = _render_csv_text(up_csv_rows)
                 markdown_output += _canonical_block(
                     up_table_md, up_csv_path, up_csv_link,
-                    context_label="common upregulated genes table"
+                    context_label="common upregulated genes table",
+                    csv_text=up_csv_text,
                 ) + "\n\n"
 
                 # Downregulated genes
@@ -1417,9 +2722,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     down_csv_rows,
                     f"common_de_down_{'_'.join(a[:25] for a in assay_ids)}_l2fc{log2fc_threshold}_p{adj_p_threshold}"
                 )
+                down_csv_text = _render_csv_text(down_csv_rows)
                 markdown_output += _canonical_block(
                     down_table_md, down_csv_path, down_csv_link,
-                    context_label="common downregulated genes table"
+                    context_label="common downregulated genes table",
+                    csv_text=down_csv_text,
                 ) + "\n\n"
 
                 # Add assay ID reference
@@ -1436,47 +2743,121 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     text=f"Error finding correlated differentially expressed genes: {e}"
                 )]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Find Common Differentially Methylated Regions (across assays)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def find_common_differentially_methylated_regions(
             assay_ids: list[str] = Field(..., description="List of assay identifiers for methylation comparisons"),
             methylation_diff_threshold: float = Field(0.0, description="Methylation difference threshold (default: 0.0 = any change)"),
-            q_value_threshold: float = Field(0.05, description="q-value threshold for significance (default: 0.05)")
+            q_value_threshold: float = Field(0.05, description="q-value threshold for significance (default: 0.05)"),
+            in_promoter: Optional[bool] = Field(
+                None,
+                description=(
+                    "MethylationRegion location filter. When True, restrict to "
+                    "regions overlapping a gene promoter. When False, exclude "
+                    "promoter-overlapping regions. None (default) imposes no "
+                    "promoter filter. Applied during the Cypher query — passing "
+                    "in_promoter=True is the correct way to ask 'which genes are "
+                    "commonly hypermethylated IN THE PROMOTER across these assays'."
+                ),
+            ),
+            in_exon: Optional[bool] = Field(
+                None,
+                description="MethylationRegion location filter (True / False / None). See in_promoter.",
+            ),
+            in_intron: Optional[bool] = Field(
+                None,
+                description="MethylationRegion location filter (True / False / None). See in_promoter.",
+            ),
+            dist_to_feature_max: Optional[int] = Field(
+                None,
+                description=(
+                    "MethylationRegion distance filter. When set, restrict to "
+                    "regions with dist_to_feature <= this value (bp). None "
+                    "(default) imposes no distance filter."
+                ),
+            ),
         ) -> list[types.TextContent]:
-            """Find common differentially methylated genes across multiple assays.
-            
+            """USE THIS TOOL (not the `query` tool) for any "common DMRs
+            across assays", "genes hypermethylated in BOTH assays", "shared
+            hyper/hypomethylated regions", or any cross-assay methylation
+            intersection question — including promoter/exon/intron-filtered
+            and distance-bounded variants. Falling back to `query` for this
+            category reproduces the per-assay fetch + inner-join logic this
+            tool already does correctly (parallel fetches, MethylationRegion
+            location filtering applied during the Cypher so the common set
+            reflects the filtered universe, methylation_diff/q_value
+            thresholds, separate hyper vs. hypo intersections) and loses
+            the formatted markdown + inline CSV side-channel and the
+            assay-reference legend.
+
+            Find common differentially methylated genes across multiple assays.
+
             This function:
             1. Takes a list of assay IDs as input (2 or more)
-            2. Gets ALL genes associated with differentially methylated regions for each assay
+            2. Gets ALL genes associated with differentially methylated regions
+               for each assay, applying the methylation_diff threshold,
+               q_value threshold, and any MethylationRegion location filters
+               (in_promoter, in_exon, in_intron, dist_to_feature_max)
             3. Inner joins among hypermethylated genes and among hypomethylated genes
             4. Returns markdown tables showing common genes and their methylation_diff values
-            
+
+            Use the location filter parameters rather than post-filtering — they
+            are applied during the Cypher query so the common gene set reflects
+            the filtered universe correctly.
             """
-            
+
             if len(assay_ids) < 2:
                 return [types.TextContent(type="text", text="Error: Please provide at least 2 assay IDs.")]
-            
+
             try:
                 hyper_genes = {}
                 hypo_genes = {}
 
-                hyper_query = """
-                MATCH (a:Assay {identifier: $assay_id})
+                # Build the MR filter block once and reuse across both queries.
+                mr_filter_parts: list[str] = []
+                mr_filter_params: dict[str, Any] = {}
+                if in_promoter is not None:
+                    mr_filter_parts.append("AND mr.in_promoter = $mr_in_promoter")
+                    mr_filter_params["mr_in_promoter"] = in_promoter
+                if in_exon is not None:
+                    mr_filter_parts.append("AND mr.in_exon = $mr_in_exon")
+                    mr_filter_params["mr_in_exon"] = in_exon
+                if in_intron is not None:
+                    mr_filter_parts.append("AND mr.in_intron = $mr_in_intron")
+                    mr_filter_params["mr_in_intron"] = in_intron
+                if dist_to_feature_max is not None:
+                    mr_filter_parts.append(
+                        "AND mr.dist_to_feature IS NOT NULL AND mr.dist_to_feature <= $mr_dist_max"
+                    )
+                    mr_filter_params["mr_dist_max"] = dist_to_feature_max
+                mr_filter_block = (
+                    "\n                  " + "\n                  ".join(mr_filter_parts)
+                ) if mr_filter_parts else ""
+
+                hyper_query = f"""
+                MATCH (a:Assay {{identifier: $assay_id}})
                       -[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->
                       (mr:MethylationRegion)
                       <-[:METHYLATED_IN_MGmMR]-(mg:MGene)
                 WHERE r.methylation_diff > $meth_threshold
-                  AND r.q_value IS NOT NULL AND r.q_value <= $q_threshold
+                  AND r.q_value IS NOT NULL AND r.q_value <= $q_threshold{mr_filter_block}
                 RETURN DISTINCT mg.symbol AS gene_symbol, r.methylation_diff AS methylation_diff
                 ORDER BY r.methylation_diff DESC
                 """
 
-                hypo_query = """
-                MATCH (a:Assay {identifier: $assay_id})
+                hypo_query = f"""
+                MATCH (a:Assay {{identifier: $assay_id}})
                       -[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->
                       (mr:MethylationRegion)
                       <-[:METHYLATED_IN_MGmMR]-(mg:MGene)
                 WHERE r.methylation_diff < -$meth_threshold
-                  AND r.q_value IS NOT NULL AND r.q_value <= $q_threshold
+                  AND r.q_value IS NOT NULL AND r.q_value <= $q_threshold{mr_filter_block}
                 RETURN DISTINCT mg.symbol AS gene_symbol, r.methylation_diff AS methylation_diff
                 ORDER BY r.methylation_diff ASC
                 """
@@ -1487,6 +2868,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                         "assay_id": aid,
                         "meth_threshold": methylation_diff_threshold,
                         "q_threshold": q_value_threshold,
+                        **mr_filter_params,
                     }
                     async with neo4j_driver.session(database=database, default_access_mode=READ_ACCESS) as s:
                         result_json = await s.execute_read(_read, cypher, params)
@@ -1546,9 +2928,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     hyper_csv_rows,
                     f"common_dm_hyper_{'_'.join(a[:25] for a in assay_ids)}_md{methylation_diff_threshold}_q{q_value_threshold}"
                 )
+                hyper_csv_text = _render_csv_text(hyper_csv_rows)
                 md += _canonical_block(
                     hyper_table_md, hyper_csv_path, hyper_csv_link,
-                    context_label="common hypermethylated genes table"
+                    context_label="common hypermethylated genes table",
+                    csv_text=hyper_csv_text,
                 ) + "\n\n"
 
                 hypo_table_md = _build_meth_table_md(
@@ -1560,9 +2944,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     hypo_csv_rows,
                     f"common_dm_hypo_{'_'.join(a[:25] for a in assay_ids)}_md{methylation_diff_threshold}_q{q_value_threshold}"
                 )
+                hypo_csv_text = _render_csv_text(hypo_csv_rows)
                 md += _canonical_block(
                     hypo_table_md, hypo_csv_path, hypo_csv_link,
-                    context_label="common hypomethylated genes table"
+                    context_label="common hypomethylated genes table",
+                    csv_text=hypo_csv_text,
                 ) + "\n\n"
 
                 md += "### Assay Reference\n\n"
@@ -1575,7 +2961,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 logger.error(f"Error finding common differentially methylated regions: {e}")
                 return [types.TextContent(type="text", text=f"Error: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Find Common Differentially Abundant Organisms (across assays)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def find_common_differentially_abundant_organisms(
             assay_ids: list[str] = Field(..., description="List of assay identifiers for abundance comparisons (e.g., different methods like DESeq2, ANCOM-BC)"),
             log2fc_threshold: float = Field(0.0, description="Minimum |log2fc| magnitude for filtering organisms (default: 0.0 = any change). Applied to BOTH DESeq2 and ANCOM-BC rows since log2fc is populated for both methods."),
@@ -1583,15 +2976,27 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for DESeq2 abundance assays (default: 0.05). Applied to rows with adj_p_value populated."),
             lnfc_threshold: Optional[float] = Field(None, description="Optional minimum |lnfc| magnitude. Only applied to rows with lnfc populated (ANCOM-BC). DESeq2 rows are not filtered by this parameter. Leave unset (None) to skip lnfc filtering entirely.")
         ) -> list[types.TextContent]:
-            """Find common differentially abundant organisms across multiple assays.
+            """USE THIS TOOL (not the `query` tool) for any "common
+            differentially abundant organisms across assays", "organisms
+            increased in BOTH assays", "shared abundance signals across
+            methods" (e.g. DESeq2 vs ANCOM-BC concordance), or any cross-assay
+            abundance intersection question. Falling back to `query` for this
+            category reproduces the per-assay fetch + inner-join logic this
+            tool already does correctly (parallel fetches, method-aware
+            significance filtering, lnfc handling that doesn't drop DESeq2
+            rows, separate increased vs. decreased intersections) and loses
+            the formatted markdown + inline CSV side-channel and the
+            assay-reference legend.
+
+            Find common differentially abundant organisms across multiple assays.
 
             Useful for comparing results from different analysis methods (e.g., DESeq2 vs ANCOM-BC 1 vs ANCOM-BC 2)
             to identify organisms consistently detected as differentially abundant.
 
             Direction (increase vs. decrease) and ranking use log2fc, which is populated for
             BOTH DESeq2 and ANCOM-BC edges in the GeneLab KG. log2fc is therefore the
-            universal magnitude filter (log2fc_threshold). Using lnfc as the direction
-            filter previously caused DESeq2 rows to be silently dropped.
+            universal magnitude filter (log2fc_threshold); lnfc is ANCOM-BC-only and
+            would null-filter every DESeq2 row if used for direction.
 
             Significance filtering is method-aware:
               - DESeq2 edges populate adj_p_value (not q_value); the adj_p_threshold applies.
@@ -1728,6 +3133,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     up_csv_rows,
                     f"common_da_up_{'_'.join(a[:25] for a in assay_ids)}_l2fc{log2fc_threshold}"
                 )
+                up_csv_text = _render_csv_text(up_csv_rows)
                 md += up_table_md + "\n"
                 if up_csv_path:
                     md += f"\n_CSV: `{up_csv_path}`_\n\n"
@@ -1743,6 +3149,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     down_csv_rows,
                     f"common_da_down_{'_'.join(a[:25] for a in assay_ids)}_l2fc{log2fc_threshold}"
                 )
+                down_csv_text = _render_csv_text(down_csv_rows)
                 md += down_table_md + "\n"
                 if down_csv_path:
                     md += f"\n_CSV: `{down_csv_path}`_\n\n"
@@ -1759,26 +3166,135 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 logger.error(f"Error finding common differentially abundant organisms: {e}")
                 return [types.TextContent(type="text", text=f"Error: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Find DE Genes Overlapping DM Regions (expression-methylation coupling)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def find_common_de_genes_overlapping_dm_regions(
             expression_assay_id: str = Field(..., description="Assay identifier for differential expression data"),
-            methylation_assay_id: str = Field(..., description="Assay identifier for differential methylation data"),
+            methylation_assay_id: "str | list[str]" = Field(
+                ...,
+                description=(
+                    "Assay identifier for differential methylation data, or a "
+                    "list of identifiers to pool. Pass a single string to use "
+                    "one methylation assay (most common). Pass a list (e.g. "
+                    "['OSD-48-968c...', 'OSD-48-4dc1...']) to pool methylation "
+                    "evidence across replicate methylation assays of the same "
+                    "comparison — a gene is treated as 'hypermethylated' if "
+                    "ANY of the pooled assays passes the threshold for it. "
+                    "This matches the natural reading of 'find DE genes that "
+                    "have hypermethylated promoter evidence in this study's "
+                    "methylation assays', where the methylation side is a "
+                    "union across assays before being intersected with the DE "
+                    "side."
+                ),
+            ),
             log2fc_threshold: float = Field(1.0, description="Log2 fold change threshold for DE genes (default: 1.0)"),
             adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for DE genes (default: 0.05)"),
             methylation_diff_threshold: float = Field(0.0, description="Methylation diff threshold for DM regions (default: 0.0)"),
-            q_value_threshold: float = Field(0.05, description="q-value threshold for DM regions (default: 0.05)")
+            q_value_threshold: float = Field(0.05, description="q-value threshold for DM regions (default: 0.05)"),
+            in_promoter: Optional[bool] = Field(
+                None,
+                description=(
+                    "MethylationRegion location filter applied to the DM side of "
+                    "the overlap. When True, only DM regions overlapping a "
+                    "promoter contribute to the methylated-gene set. Use this "
+                    "for classical epigenetic-silencing questions: 'which "
+                    "downregulated genes have hypermethylation in their "
+                    "promoter?' → pass in_promoter=True."
+                ),
+            ),
+            in_exon: Optional[bool] = Field(
+                None,
+                description="MethylationRegion location filter (True / False / None). See in_promoter.",
+            ),
+            in_intron: Optional[bool] = Field(
+                None,
+                description="MethylationRegion location filter (True / False / None). See in_promoter.",
+            ),
+            dist_to_feature_max: Optional[int] = Field(
+                None,
+                description=(
+                    "MethylationRegion distance filter. When set, only DM regions "
+                    "with dist_to_feature <= this value (bp) contribute to the "
+                    "methylated-gene set. None (default) imposes no distance filter."
+                ),
+            ),
         ) -> list[types.TextContent]:
-            """Find differentially expressed genes that overlap with differentially methylated regions.
-            
+            """USE THIS TOOL (not the `query` tool) for any
+            "expression-methylation coupling", "classical epigenetic
+            silencing", "DE genes that are also DM", "downregulated genes
+            with promoter hypermethylation", or any cross-type
+            intersection between differential expression and differential
+            methylation. Falling back to `query` for this category reproduces
+            the four-quadrant intersection logic this tool already does
+            correctly (parallel DE+DM fetches across DIFFERENT assays,
+            pooled-methylation aggregation when multiple methylation assays
+            are passed as a list, MethylationRegion location filtering on the
+            DM side, up_hyper/up_hypo/down_hyper/down_hypo direction
+            categorization) and loses the four-quadrant markdown summary and
+            the inline combined CSV.
+
+            Find differentially expressed genes that overlap with differentially methylated regions.
+
             This cross-analysis tool:
             1. Gets DE genes from the expression assay (filtered by log2fc and adj_p thresholds)
-            2. Gets genes associated with DM regions from the methylation assay (filtered by methylation_diff and q_value)
+            2. Gets genes associated with DM regions from the methylation assay(s)
+               (filtered by methylation_diff, q_value, and any MethylationRegion
+               location filters: in_promoter, in_exon, in_intron, dist_to_feature_max).
+               If `methylation_assay_id` is a list, the methylation evidence is
+               POOLED across the listed assays before the intersection — a gene
+               is treated as hypermethylated if it passes the threshold in ANY
+               of the pooled assays.
             3. Finds the intersection (genes that are BOTH differentially expressed AND differentially methylated)
             4. Reports the overlap categorized by direction (up+hyper, up+hypo, down+hyper, down+hypo)
-            
+
+            For the classical epigenetic-silencing question — promoter
+            hypermethylation reducing expression — pass in_promoter=True.
+            When a study has replicate methylation assays (e.g. OSD-48 has
+            two methylKit assays for the same Space Flight vs. Ground Control
+            comparison), pass them as a list to capture the combined methylation
+            evidence on the methylation side of the intersection.
             """
-            
+
+            # Normalize methylation_assay_id to a list so pooled and single
+            # paths share one implementation.
+            if isinstance(methylation_assay_id, str):
+                methylation_assay_ids = [methylation_assay_id]
+            else:
+                methylation_assay_ids = list(methylation_assay_id)
+            if not methylation_assay_ids:
+                return [types.TextContent(
+                    type="text",
+                    text="Error: at least one methylation_assay_id must be provided.",
+                )]
+
             try:
+                # Build the MR filter block once and reuse across both DM queries.
+                mr_filter_parts: list[str] = []
+                mr_filter_params: dict[str, Any] = {}
+                if in_promoter is not None:
+                    mr_filter_parts.append("AND mr.in_promoter = $mr_in_promoter")
+                    mr_filter_params["mr_in_promoter"] = in_promoter
+                if in_exon is not None:
+                    mr_filter_parts.append("AND mr.in_exon = $mr_in_exon")
+                    mr_filter_params["mr_in_exon"] = in_exon
+                if in_intron is not None:
+                    mr_filter_parts.append("AND mr.in_intron = $mr_in_intron")
+                    mr_filter_params["mr_in_intron"] = in_intron
+                if dist_to_feature_max is not None:
+                    mr_filter_parts.append(
+                        "AND mr.dist_to_feature IS NOT NULL AND mr.dist_to_feature <= $mr_dist_max"
+                    )
+                    mr_filter_params["mr_dist_max"] = dist_to_feature_max
+                mr_filter_block = (
+                    "\n                  " + "\n                  ".join(mr_filter_parts)
+                ) if mr_filter_parts else ""
+
                 # Get DE genes
                 up_de_query = """
                 MATCH (a:Assay {identifier: $assay_id})
@@ -1798,29 +3314,36 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 RETURN mg.symbol AS gene_symbol, r.log2fc AS log2fc
                 """
 
-                # Get DM genes
-                hyper_dm_query = """
-                MATCH (a:Assay {identifier: $assay_id})
+                # Get DM genes. Both queries use `a.identifier IN $assay_ids`
+                # so pooled and single-assay calls share the same Cypher path —
+                # the gene set returned is the UNION across assays (a gene
+                # appears once with the most-extreme methylation_diff seen).
+                # The aggregation (max for hyper, min for hypo) captures the
+                # strongest evidence across pooled assays per gene.
+                hyper_dm_query = f"""
+                MATCH (a:Assay)
                       -[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->
                       (mr:MethylationRegion)
                       <-[:METHYLATED_IN_MGmMR]-(mg:MGene)
-                WHERE r.methylation_diff > $meth_threshold
-                  AND r.q_value IS NOT NULL AND r.q_value <= $q_threshold
-                RETURN DISTINCT mg.symbol AS gene_symbol, r.methylation_diff AS methylation_diff
+                WHERE a.identifier IN $assay_ids
+                  AND r.methylation_diff > $meth_threshold
+                  AND r.q_value IS NOT NULL AND r.q_value <= $q_threshold{mr_filter_block}
+                RETURN mg.symbol AS gene_symbol, max(r.methylation_diff) AS methylation_diff
                 """
 
-                hypo_dm_query = """
-                MATCH (a:Assay {identifier: $assay_id})
+                hypo_dm_query = f"""
+                MATCH (a:Assay)
                       -[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->
                       (mr:MethylationRegion)
                       <-[:METHYLATED_IN_MGmMR]-(mg:MGene)
-                WHERE r.methylation_diff < -$meth_threshold
-                  AND r.q_value IS NOT NULL AND r.q_value <= $q_threshold
-                RETURN DISTINCT mg.symbol AS gene_symbol, r.methylation_diff AS methylation_diff
+                WHERE a.identifier IN $assay_ids
+                  AND r.methylation_diff < -$meth_threshold
+                  AND r.q_value IS NOT NULL AND r.q_value <= $q_threshold{mr_filter_block}
+                RETURN mg.symbol AS gene_symbol, min(r.methylation_diff) AS methylation_diff
                 """
-                
+
                 de_params = {"assay_id": expression_assay_id, "log2fc_threshold": log2fc_threshold, "adj_p_threshold": adj_p_threshold}
-                dm_params = {"assay_id": methylation_assay_id, "meth_threshold": methylation_diff_threshold, "q_threshold": q_value_threshold}
+                dm_params = {"assay_ids": methylation_assay_ids, "meth_threshold": methylation_diff_threshold, "q_threshold": q_value_threshold, **mr_filter_params}
                 
                 # Run all 4 reads concurrently — DE and DM queries are independent
                 # and use different assays.
@@ -1852,7 +3375,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 
                 md = f"## DE Genes Overlapping DM Regions\n\n"
                 md += f"**Expression Assay:** `{expression_assay_id}`\n"
-                md += f"**Methylation Assay:** `{methylation_assay_id}`\n\n"
+                if len(methylation_assay_ids) == 1:
+                    md += f"**Methylation Assay:** `{methylation_assay_ids[0]}`\n\n"
+                else:
+                    assay_list_md = ", ".join(f"`{a}`" for a in methylation_assay_ids)
+                    md += f"**Methylation Assays (pooled across {len(methylation_assay_ids)}):** {assay_list_md}\n\n"
                 md += f"**DE Thresholds:** |log2fc| > {log2fc_threshold}, adj_p < {adj_p_threshold}\n"
                 md += f"**DM Thresholds:** |methylation_diff| > {methylation_diff_threshold}, q_value < {q_value_threshold}\n\n"
                 md += f"**Summary:** {len(all_de)} DE genes, {len(all_dm)} DM genes, **{len(total_overlap)} overlapping**\n\n"
@@ -1890,10 +3417,17 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     _overlap_rows(down_hyper, down_de, hyper_dm, "down_hyper") +
                     _overlap_rows(down_hypo, down_de, hypo_dm, "down_hypo")
                 )
+                # CSV filename stem: include the methylation pool size when
+                # pooled so the saved file reflects the actual analysis.
+                if len(methylation_assay_ids) == 1:
+                    meth_stem = methylation_assay_ids[0][:30]
+                else:
+                    meth_stem = f"pooled{len(methylation_assay_ids)}_{methylation_assay_ids[0][:24]}"
                 combined_csv_path, combined_csv_link = _write_results_csv(
                     all_overlap_rows,
-                    f"de_dm_overlap_{expression_assay_id[:30]}_vs_{methylation_assay_id[:30]}"
+                    f"de_dm_overlap_{expression_assay_id[:30]}_vs_{meth_stem}"
                 )
+                combined_csv_text = _render_csv_text(all_overlap_rows)
 
                 quadrants = [
                     (up_hyper, "Upregulated & Hypermethylated", up_de, hyper_dm, "up_hyper"),
@@ -1901,13 +3435,21 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     (down_hyper, "Downregulated & Hypermethylated", down_de, hyper_dm, "down_hyper"),
                     (down_hypo, "Downregulated & Hypomethylated", down_de, hypo_dm, "down_hypo"),
                 ]
-                for genes, title, de_dict, dm_dict, label in quadrants:
+                for idx, (genes, title, de_dict, dm_dict, label) in enumerate(quadrants):
                     table_md = _overlap_table(genes, title, de_dict, dm_dict, "Log2FC", "Meth Diff (%)")
-                    # Each quadrant's canonical block points to the single combined CSV (with category column to filter on)
-                    md += _canonical_block(
-                        table_md, combined_csv_path, combined_csv_link,
-                        context_label=f"{label} overlap table"
-                    ) + "\n\n"
+                    # The combined CSV covers all 4 quadrants (it has a `category`
+                    # column to filter on). Emit it ONLY with the first table to
+                    # avoid 4× duplicating the same CSV bytes in the response.
+                    # Subsequent tables show just the markdown table and refer
+                    # back to the same CSV.
+                    if idx == 0:
+                        md += _canonical_block(
+                            table_md, combined_csv_path, combined_csv_link,
+                            context_label=f"{label} overlap table",
+                            csv_text=combined_csv_text,
+                        ) + "\n\n"
+                    else:
+                        md += table_md + "\n\n"
 
                 return [types.TextContent(type="text", text=md, mimeType="text/markdown")]
 
@@ -1916,7 +3458,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 return [types.TextContent(type="text", text=f"Error: {e}")]
 
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Create Volcano Plot (expression / methylation / abundance)",
+            "readOnlyHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+    )
     async def create_volcano_plot(
         assay_id: str = Field(..., description="Assay identifier (e.g., 'OSD-253-6c5f9f37b9cb2ebeb2743875af4bdc86')"),
         data_type: str = Field("expression", description="Which kind of differential data to plot. Options: 'expression' (differentially expressed genes), 'methylation' (differentially methylated regions), 'abundance' (differentially abundant organisms; works for both DESeq2 and ANCOM-BC). Default: 'expression'."),
@@ -1951,9 +3500,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
         Returns a markdown summary, an inline PNG image (if small enough), and the
         saved file path. Designed to handle assays with thousands of features without
-        timing out — the previous version used adjustText with lim=500 over the full
-        scatter, which was O(n_labels × n_points × 500) and could exceed several minutes
-        on assays with 3000+ significant features.
+        timing out.
         """
 
         valid_types = ("expression", "methylation", "abundance")
@@ -2096,7 +3643,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             p_safe = np.maximum(p_vals, p_floor)
             neg_log10_p = -np.log10(p_safe)
 
-            # ---- Classify (vectorized; previous version used a Python loop) ---
+            # ---- Classify (vectorized) ---
             sig_p = p_vals <= adj_p_threshold
             sig_up = sig_p & (x_vals > magnitude_threshold)
             sig_down = sig_p & (x_vals < -magnitude_threshold)
@@ -2114,7 +3661,6 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             # 4-minute timeout reported on the OSD-244 30-day assay where many
             # volcano plot calls happened in sequence.
             fig, ax = plt.subplots(figsize=(figsize_width, figsize_height))
-            output_path = None
             try:
                 # Not-significant first (gray), then colored points on top.
                 ax.scatter(x_vals[not_sig], neg_log10_p[not_sig],
@@ -2129,8 +3675,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
                 # ---- Pick top_n labels: smallest p among significant points ---
                 # np.argsort on neg_log10_p (descending) and take top_n that are sig.
-                # This is O(n log n) on numpy arrays — vectorized vs. the previous
-                # Python-list-comprehension + sort.
+                # O(n log n) on numpy arrays.
                 sig_mask = sig_up | sig_down
                 sig_idx = np.where(sig_mask)[0]
                 if sig_idx.size and top_n > 0:
@@ -2197,26 +3742,39 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 plt.tight_layout()
 
                 # ---- Save to disk --------------------------------------------
-                safe_filename = re.sub(r'[^\w\-]', '_', f'{study}_{data_type}_{factors_1_str}_vs_{factors_2_str}')
-                safe_filename = re.sub(r'_+', '_', safe_filename).strip('_')
+                # ---- Save plot to memory + (when reachable) to disk --------
+                # Always render to an in-memory BytesIO so we have the PNG bytes
+                # for both: (a) inline ImageContent in the response, and (b) the
+                # embedded "Save to your local machine" command. Then write to
+                # the resolved disk path so users on stdio/local deployments
+                # also get a direct file at the user-facing location.
+                import io as _io
+                png_buf = _io.BytesIO()
+                plt.savefig(png_buf, format='png', dpi=120, bbox_inches='tight')
+                png_buf.seek(0)
+                png_bytes = png_buf.getvalue()
 
-                is_claude_env = os.path.exists('/mnt/user-data/outputs')
-                if is_claude_env:
-                    output_dir = '/mnt/user-data/outputs'
-                else:
-                    output_dir = os.path.expanduser('~/Downloads')
-
-                output_path = os.path.join(output_dir, f'volcano_plot_{safe_filename}.png')
-
-                try:
-                    os.makedirs(output_dir, exist_ok=True)
-                    # Pick a DPI that keeps the file under the 700KB inline limit
-                    # on most assays; very large plots will fall back to file-only.
-                    plt.savefig(output_path, format='png', dpi=120, bbox_inches='tight')
-                    logger.info(f"Volcano plot saved: {output_path}")
-                except Exception as save_err:
-                    logger.error(f"Could not save volcano plot to {output_path}: {save_err}")
-                    output_path = None
+                stem = f'volcano_plot_{study}_{data_type}_{factors_1_str}_vs_{factors_2_str}'
+                write_path, user_facing_path, download_link = _resolve_output_paths(
+                    stem, extension="png"
+                )
+                # Only write the PNG to the server's filesystem in stdio/local
+                # mode where the user can actually reach it. In AgentCore /
+                # remote deployments the inline ImageContent + on-demand
+                # get_save_script is the user's reachable copy; writing to
+                # /tmp inside the microVM is dead I/O that leaks across
+                # stateful sessions.
+                if not _is_remote_deployment():
+                    try:
+                        os.makedirs(os.path.dirname(write_path), exist_ok=True)
+                        with open(write_path, "wb") as f:
+                            f.write(png_bytes)
+                        logger.info(f"Volcano plot saved to {write_path}")
+                    except Exception as save_err:
+                        logger.warning(f"Could not save volcano plot to {write_path}: {save_err}")
+                        # Even if disk write failed, png_bytes is still available
+                        # for inline + the embedded save command.
+                    write_path = None
             finally:
                 # Always close the figure to prevent matplotlib memory leaks.
                 plt.close(fig)
@@ -2243,37 +3801,63 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 f"- {negative_label}: {n_sig_down}\n"
                 f"- Not significant: {n_not_sig}\n"
             )
-            if output_path:
-                summary += f"\n**File saved to:** `{output_path}`\n"
+            summary += f"\n**File saved to:** `{user_facing_path}`\n"
 
             result_items: list[types.Content] = [
                 types.TextContent(type="text", text=summary, mimeType="text/markdown"),
             ]
 
-            # Inline base64 image when the PNG is small enough to fit inside MCP's
-            # ~1MB tool-result envelope. The 700KB cap leaves headroom for the
-            # text summary, base64 expansion (~33%), and JSON wrapping overhead.
-            if output_path and os.path.exists(output_path):
-                try:
-                    file_size = os.path.getsize(output_path)
-                    if file_size < 700_000:
-                        with open(output_path, "rb") as img_file:
-                            img_b64 = base64.standard_b64encode(img_file.read()).decode("utf-8")
-                        result_items.append(
-                            types.ImageContent(type="image", data=img_b64, mimeType="image/png")
-                        )
-                    else:
-                        logger.info(f"Volcano plot too large for inline ({file_size} bytes), file path only")
-                except Exception as img_err:
-                    logger.warning(f"Could not encode volcano plot image: {img_err}")
-
-            if output_path:
+            # Inline base64 image for direct display in the chat. AgentCore
+            # Runtime allows 100 MB payloads; we cap at 50 MB defensively to
+            # leave headroom for clients with stricter size limits.
+            if len(png_bytes) < 50_000_000:
+                img_b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
                 result_items.append(
-                    types.TextContent(
-                        type="text",
-                        text=f"Volcano plot PNG saved to: {output_path}",
-                    )
+                    types.ImageContent(type="image", data=img_b64, mimeType="image/png")
                 )
+            else:
+                logger.warning(
+                    f"Volcano plot too large for inline ({len(png_bytes)} bytes); "
+                    f"image not embedded inline"
+                )
+
+            # Save instructions: cross-client portable mechanism for getting
+            # the inline PNG bytes onto the user's local filesystem when this
+            # MCP server runs in a remote container. The block offers three
+            # options: right-click save, LLM-client filesystem write, and a
+            # multi-line Python script. See _make_save_instructions.
+            #
+            # Size-aware guard: emitting both the inline ImageContent AND the
+            # save-instructions block doubles the PNG payload (once as
+            # ImageContent base64, once inside the script). For plots over
+            # ~350KB, this can push the total response past Claude Desktop's
+            # ~1MB tool-result cap. In that case we emit a SHORTER guidance
+            # text that points users to the inline image (right-click save)
+            # rather than embedding the bytes a second time.
+            suggested_filename = os.path.basename(user_facing_path)
+
+            # Register the plot in the per-session "last plots" registry so the
+            # user can later call `get_save_script(filename=...)` to retrieve a
+            # full self-contained Python save script. This decouples the bulky
+            # base64 payload from the routine plot response: the response stays
+            # small (only the inline ImageContent), and the user pulls the
+            # heavy script on demand when they actually want to save the file
+            # outside of right-click-save.
+            _register_plot(suggested_filename, png_bytes, user_facing_path)
+
+            # Short save hint (~400 bytes) describing the three save options
+            # WITHOUT duplicating the PNG bytes in the response. The previous
+            # design embedded the full base64 script inline, doubling the
+            # response size and burning conversation context ~2× faster than
+            # necessary. The hint points users to right-click save, LLM-client
+            # filesystem write, or the on-demand `get_save_script` tool.
+            result_items.append(
+                types.TextContent(
+                    type="text",
+                    text=_make_save_hint(user_facing_path, suggested_filename, len(png_bytes)),
+                    mimeType="text/markdown",
+                )
+            )
 
             return result_items
 
@@ -2281,7 +3865,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             logger.error(f"Error creating volcano plot: {e}")
             return [types.TextContent(type="text", text=f"Error creating volcano plot: {e}")]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Create Venn Diagram (2-way or 3-way; cross-type supported)",
+            "readOnlyHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+    )
     async def create_venn_diagram(
         assay_id_1: str = Field(..., description="First assay identifier"),
         assay_id_2: str = Field(..., description="Second assay identifier"),
@@ -2293,6 +3884,10 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         q_value_threshold: float = Field(0.05, description="q-value threshold (default: 0.05). Applied to methylation assays and to ANCOM-BC abundance rows."),
         lnfc_threshold: Optional[float] = Field(None, description="Optional minimum |lnfc| magnitude for the 'abundance' data type. Only applied to rows with lnfc populated (ANCOM-BC). DESeq2 rows are not filtered by this parameter. Ignored for non-abundance data types. Leave unset (None) to skip lnfc filtering."),
         direction_pair: str = Field("all", description="For data_type='expression_methylation' only: which directional overlap(s) to render. 'all' (default) renders a 2x2 grid of all four biologically meaningful combinations: hypermethylated+downregulated (classical epigenetic silencing), hypomethylated+upregulated (loss of methylation enabling expression), hypermethylated+upregulated, and hypomethylated+downregulated. Specify one of 'hyper_down', 'hypo_up', 'hyper_up', 'hypo_down' to render only that single overlap. Ignored for non-expression_methylation data types."),
+        in_promoter: Optional[bool] = Field(None, description="MethylationRegion location filter (data_type='methylation' or 'expression_methylation' only). When True, only include methylation regions overlapping a gene promoter. When False, exclude promoter-overlapping regions. None (default) imposes no promoter filter. Maps directly to the in_promoter property on MethylationRegion nodes."),
+        in_exon: Optional[bool] = Field(None, description="MethylationRegion location filter (data_type='methylation' or 'expression_methylation' only). When True, only include methylation regions overlapping an exon. When False, exclude exon-overlapping regions. None (default) imposes no exon filter. Maps directly to the in_exon property on MethylationRegion nodes."),
+        in_intron: Optional[bool] = Field(None, description="MethylationRegion location filter (data_type='methylation' or 'expression_methylation' only). When True, only include methylation regions overlapping an intron. When False, exclude intron-overlapping regions. None (default) imposes no intron filter. Maps directly to the in_intron property on MethylationRegion nodes."),
+        dist_to_feature_max: Optional[int] = Field(None, description="MethylationRegion distance filter (data_type='methylation' or 'expression_methylation' only). When set, only include methylation regions whose dist_to_feature (distance in bp to the nearest gene feature) is <= this value. Useful for restricting to regions close to gene bodies. None (default) imposes no distance filter."),
         figsize_width: int = Field(10, description="Figure width in inches"),
         figsize_height: int = Field(6, description="Figure height in inches")
     ) -> list[types.Content]:
@@ -2320,6 +3915,22 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         downregulated genes"), pass direction_pair='hyper_down' to render just that one.
         The summary always reports the size of all four overlaps, regardless of which
         subset is rendered.
+
+        Methylation region location filters (for data_type='methylation' and the methylation
+        side of 'expression_methylation'):
+        - in_promoter, in_exon, in_intron: each accepts True (include only regions where this
+          flag is true), False (exclude regions where this flag is true), or None (no filter).
+          Multiple filters combine with AND. For example, in_promoter=True alone restricts
+          to promoter-overlapping regions; in_promoter=True with in_intron=False restricts
+          to promoter regions that are NOT intronic.
+        - dist_to_feature_max: when set, include only regions whose distance to the nearest
+          gene feature is <= this value (in bp). Useful for narrowing to regions tightly
+          associated with gene bodies. dist_to_feature on the MethylationRegion node is
+          the bp distance from the region to the nearest annotated feature.
+        These filters apply during the Cypher query — they reduce the set of methylation
+        regions BEFORE the overlap computation, so each gene set is the genes that have at
+        least one methylation region passing all the filters and the magnitude/significance
+        criteria.
 
         Significance filtering:
         - 'expression' and 'expression_methylation' (expression side): adj_p_value <= adj_p_threshold (default 0.05).
@@ -2371,13 +3982,34 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 item_label = "genes"
                 
             elif data_type == "methylation":
-                item_query = """
-                MATCH (a:Assay {identifier: $assay_id})
+                # Build the MethylationRegion location/distance filter clause.
+                # Each in_promoter/in_exon/in_intron is a tri-state (True/False/None);
+                # only non-None values produce a clause. dist_to_feature_max, when
+                # set, adds an upper bound on distance. Parameters are passed via
+                # $name placeholders so they're properly escaped by Neo4j.
+                mr_clauses: list[str] = []
+                mr_params: dict[str, Any] = {}
+                if in_promoter is not None:
+                    mr_clauses.append("                  AND mr.in_promoter = $mr_in_promoter")
+                    mr_params["mr_in_promoter"] = in_promoter
+                if in_exon is not None:
+                    mr_clauses.append("                  AND mr.in_exon = $mr_in_exon")
+                    mr_params["mr_in_exon"] = in_exon
+                if in_intron is not None:
+                    mr_clauses.append("                  AND mr.in_intron = $mr_in_intron")
+                    mr_params["mr_in_intron"] = in_intron
+                if dist_to_feature_max is not None:
+                    mr_clauses.append("                  AND mr.dist_to_feature IS NOT NULL AND mr.dist_to_feature <= $mr_dist_max")
+                    mr_params["mr_dist_max"] = dist_to_feature_max
+                mr_filter_block = ("\n" + "\n".join(mr_clauses)) if mr_clauses else ""
+
+                item_query = f"""
+                MATCH (a:Assay {{identifier: $assay_id}})
                       -[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->
                       (mr:MethylationRegion)
                       <-[:METHYLATED_IN_MGmMR]-(mg:MGene)
                 WHERE (r.methylation_diff > $threshold OR r.methylation_diff < -$threshold)
-                  AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold
+                  AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold{mr_filter_block}
                 RETURN mg.symbol AS item_id, r.methylation_diff AS value
                 """
                 positive_label = "Hypermethylated Genes"
@@ -2386,6 +4018,9 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 negative_criterion = lambda v, t: v < -t
                 threshold_key = "methylation_diff"
                 item_label = "genes"
+                # Stash the MethylationRegion params so the per-assay caller below
+                # can merge them into the item_query parameter dict.
+                _methylation_mr_params = mr_params
                 
             elif data_type == "abundance":
                 # Conditionally include the lnfc magnitude clause. When lnfc_threshold is
@@ -2428,13 +4063,35 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                   AND r.adj_p_value IS NOT NULL AND r.adj_p_value <= $adj_p_threshold
                 RETURN mg.symbol AS item_id, r.log2fc AS value
                 """
-                meth_query = """
-                MATCH (a:Assay {identifier: $assay_id})
+
+                # Build the MethylationRegion location/distance filter clause for
+                # the methylation side of this cross-comparison. Same tri-state
+                # semantics as in the 'methylation' branch above; see comment
+                # there for details. Parameters use distinct names (mr_*) so
+                # they don't collide with $assay_id / $meth_threshold / $q_value_threshold.
+                em_mr_clauses: list[str] = []
+                em_mr_params: dict[str, Any] = {}
+                if in_promoter is not None:
+                    em_mr_clauses.append("                  AND mr.in_promoter = $mr_in_promoter")
+                    em_mr_params["mr_in_promoter"] = in_promoter
+                if in_exon is not None:
+                    em_mr_clauses.append("                  AND mr.in_exon = $mr_in_exon")
+                    em_mr_params["mr_in_exon"] = in_exon
+                if in_intron is not None:
+                    em_mr_clauses.append("                  AND mr.in_intron = $mr_in_intron")
+                    em_mr_params["mr_in_intron"] = in_intron
+                if dist_to_feature_max is not None:
+                    em_mr_clauses.append("                  AND mr.dist_to_feature IS NOT NULL AND mr.dist_to_feature <= $mr_dist_max")
+                    em_mr_params["mr_dist_max"] = dist_to_feature_max
+                em_mr_filter_block = ("\n" + "\n".join(em_mr_clauses)) if em_mr_clauses else ""
+
+                meth_query = f"""
+                MATCH (a:Assay {{identifier: $assay_id}})
                       -[r:MEASURED_DIFFERENTIAL_METHYLATION_ASmMR]->
                       (mr:MethylationRegion)
                       <-[:METHYLATED_IN_MGmMR]-(mg:MGene)
                 WHERE (r.methylation_diff > $meth_threshold OR r.methylation_diff < -$meth_threshold)
-                  AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold
+                  AND r.q_value IS NOT NULL AND r.q_value <= $q_value_threshold{em_mr_filter_block}
                 RETURN DISTINCT mg.symbol AS item_id, r.methylation_diff AS value
                 """
             
@@ -2463,17 +4120,33 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
             # Build the items-fetch task list
             if data_type == "expression_methylation":
-                # Assay 1 = expression, Assay 2 = methylation
+                # Assay 1 = expression, Assay 2 = methylation. The methylation
+                # query also receives any MethylationRegion location/distance
+                # filter parameters that were set on the tool call. em_mr_params
+                # is built in the expression_methylation branch above; it's an
+                # empty dict if no MR filters were specified.
+                meth_call_params = {
+                    "assay_id": assay_id_2,
+                    "threshold": log2fc_threshold,
+                    "meth_threshold": methylation_diff_threshold,
+                    "q_value_threshold": q_value_threshold,
+                    **em_mr_params,
+                }
                 items_tasks = [
                     _run(expr_query, {"assay_id": assay_id_1, "threshold": log2fc_threshold, "adj_p_threshold": adj_p_threshold}),
-                    _run(meth_query, {"assay_id": assay_id_2, "threshold": log2fc_threshold, "meth_threshold": methylation_diff_threshold, "q_value_threshold": q_value_threshold}),
+                    _run(meth_query, meth_call_params),
                 ]
             else:
                 # Build per-data-type extra params for item_query
                 if data_type == "expression":
                     item_params_extra = {"adj_p_threshold": adj_p_threshold}
                 elif data_type == "methylation":
-                    item_params_extra = {"q_value_threshold": q_value_threshold}
+                    # For methylation, plumb the MethylationRegion filter params
+                    # (in_promoter/in_exon/in_intron/dist_to_feature_max) through
+                    # to every per-assay query. _methylation_mr_params was built
+                    # in the methylation branch above; it's an empty dict if no
+                    # MR filters were specified.
+                    item_params_extra = {"q_value_threshold": q_value_threshold, **_methylation_mr_params}
                 else:  # abundance — method-aware, needs both significance thresholds
                     item_params_extra = {"adj_p_threshold": adj_p_threshold, "q_value_threshold": q_value_threshold}
                     # lnfc_threshold is only referenced in the query string when set;
@@ -2797,25 +4470,43 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 plt.tight_layout(rect=[0, 0.16, 1, 0.96])
             
             # --- Save the figure ---
-            safe_study = re.sub(r'[^\w\-]', '_', study)
+            # Render to in-memory PNG bytes; downstream code uses them for
+            # both the inline ImageContent and the on-demand save script.
+            import io as _venn_io
             num_assays = 3 if (assay_id_3 and data_type != "expression_methylation") else 2
-            safe_filename = f'venn_{data_type}_{num_assays}way_{safe_study}'
-            safe_filename = safe_filename.replace("__", "_")[:80]
-            
-            is_claude_env = os.path.exists('/mnt/user-data/outputs')
-            output_dir = '/mnt/user-data/outputs' if is_claude_env else os.path.expanduser('~/Downloads')
-            output_path = os.path.join(output_dir, f'{safe_filename}.png')
-            
+            png_buf = _venn_io.BytesIO()
             try:
-                os.makedirs(output_dir, exist_ok=True)
-                plt.savefig(output_path, format='png', dpi=150, bbox_inches='tight')
-                if os.path.exists(output_path):
-                    logger.info(f"SUCCESS: Venn saved: {output_path} ({os.path.getsize(output_path)} bytes)")
-                else:
-                    logger.error(f"FAILED: Venn not found after save: {output_path}")
-            except Exception as e:
-                logger.error(f"ERROR saving Venn: {e}")
-            
+                # dpi=120 matches the volcano tool to keep inline ImageContent
+                # payloads small and uniform across plot types.
+                plt.savefig(png_buf, format='png', dpi=120, bbox_inches='tight')
+                png_buf.seek(0)
+                venn_png_bytes = png_buf.getvalue()
+                logger.info(f"SUCCESS: Venn rendered to memory ({len(venn_png_bytes)} bytes)")
+            except Exception as render_err:
+                logger.error(f"ERROR rendering Venn PNG: {render_err}")
+                venn_png_bytes = None
+
+            stem = f'venn_{data_type}_{num_assays}way_{study}'
+            venn_write_path, venn_user_facing_path, venn_download_link = _resolve_output_paths(
+                stem, extension="png"
+            )
+
+            if venn_png_bytes is not None and not _is_remote_deployment():
+                # Only write to the server's filesystem in stdio/local mode
+                # where the user can actually reach the file. In AgentCore /
+                # remote deployments the inline ImageContent + on-demand
+                # get_save_script is the user's reachable copy.
+                try:
+                    os.makedirs(os.path.dirname(venn_write_path), exist_ok=True)
+                    with open(venn_write_path, "wb") as f:
+                        f.write(venn_png_bytes)
+                    logger.info(f"Venn saved to {venn_write_path} ({len(venn_png_bytes)} bytes)")
+                except Exception as save_err:
+                    logger.warning(f"Could not save Venn to {venn_write_path}: {save_err}")
+                    # The PNG bytes are still in memory and will be returned
+                    # inline + via the save command, so disk-write failure is
+                    # not fatal.
+
             plt.close(fig)
             
             # --- Build summary ---
@@ -2849,7 +4540,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
 **Thresholds:** Log2FC ≥ ±{log2fc_threshold} (adj.p ≤ {adj_p_threshold}), Methylation Diff ≥ ±{methylation_diff_threshold} (q ≤ {q_value_threshold})
 
-**File saved to:** {output_path}
+**File saved to:** {venn_user_facing_path}
 
 ### Set sizes
 - Upregulated genes: {len(de_genes_up)}
@@ -2926,7 +4617,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
 **Threshold:** {threshold_key} ≥ ±{threshold_val}
 
-**File saved to:** {output_path}
+**File saved to:** {venn_user_facing_path}
 
 ### {positive_label}:
 - Assay 1 only: {pos_only_1} | Assay 2 only: {pos_only_2} | Assay 3 only: {pos_only_3}
@@ -2959,7 +4650,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
 **Threshold:** {threshold_key} ≥ ±{threshold_val}
 
-**File saved to:** {output_path}
+**File saved to:** {venn_user_facing_path}
 
 ### {positive_label}:
 - Assay 1 only: {pos_only_1}
@@ -2978,28 +4669,43 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             venn_result_items: list[types.Content] = [
                 types.TextContent(type="text", text=summary, mimeType="text/markdown"),
             ]
-            
-            if output_path and os.path.exists(output_path):
-                try:
-                    file_size = os.path.getsize(output_path)
-                    if file_size < 700_000:
-                        with open(output_path, "rb") as img_file:
-                            img_b64 = base64.standard_b64encode(img_file.read()).decode("utf-8")
-                        venn_result_items.append(
-                            types.ImageContent(type="image", data=img_b64, mimeType="image/png")
-                        )
-                    else:
-                        logger.info(f"Venn too large for inline ({file_size} bytes)")
-                except Exception as img_err:
-                    logger.warning(f"Could not encode Venn image: {img_err}")
-            
-            venn_result_items.append(
-                types.TextContent(
-                    type="text",
-                    text=f"Venn diagram PNG saved to: {output_path}",
+
+            # Inline base64 image from the in-memory bytes captured during save.
+            # AgentCore Runtime supports 100 MB payloads; defensive 50 MB cap
+            # protects against pathological cases on smaller-capacity clients.
+            if venn_png_bytes is not None:
+                if len(venn_png_bytes) < 50_000_000:
+                    img_b64 = base64.standard_b64encode(venn_png_bytes).decode("utf-8")
+                    venn_result_items.append(
+                        types.ImageContent(type="image", data=img_b64, mimeType="image/png")
+                    )
+                else:
+                    logger.warning(
+                        f"Venn too large for inline ({len(venn_png_bytes)} bytes); "
+                        f"image not embedded inline"
+                    )
+
+                # Save instructions: cross-client portable mechanism for
+                # delivering the PNG bytes to the user's local filesystem in
+                # remote deployments. See _make_save_instructions for full
+                # rationale. Same pattern as the volcano tool: register the
+                # plot bytes for on-demand save-script retrieval via
+                # `get_save_script`, then emit only the short hint to keep the
+                # response compact.
+                venn_suggested_filename = os.path.basename(venn_user_facing_path)
+                _register_plot(venn_suggested_filename, venn_png_bytes, venn_user_facing_path)
+                venn_result_items.append(
+                    types.TextContent(
+                        type="text",
+                        text=_make_save_hint(
+                            venn_user_facing_path,
+                            venn_suggested_filename,
+                            len(venn_png_bytes),
+                        ),
+                        mimeType="text/markdown",
+                    )
                 )
-            )
-            
+
             return venn_result_items
             
         except Exception as e:
@@ -3009,7 +4715,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             return [types.TextContent(type="text", text=f"Error creating Venn diagram: {e}")]
 
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Clean Mermaid Class Diagram",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     def clean_mermaid_diagram(mermaid_content: str) -> list[types.TextContent]:
         """Clean a Mermaid class diagram by removing unwanted elements.
         
@@ -3091,7 +4804,14 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         cleaned_content = '\n'.join(cleaned_lines)
         return [types.TextContent(type="text", text=cleaned_content)]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Create Chat Transcript (prompt only)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def create_chat_transcript() -> list[types.TextContent]:
         """Prompt for creating a chat transcript in markdown format with user prompts and Claude responses."""
         today = datetime.now().strftime("%Y-%m-%d")
@@ -3132,7 +4852,14 @@ IMPORTANT:
 """
         return [types.TextContent(type="text", text=prompt)]
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Visualize KG Schema (prompt only)",
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
     async def visualize_schema() -> list[types.TextContent]:
         """Prompt for visualizing the knowledge graph schema using a Mermaid class diagram."""
         prompt = """Visualize the knowledge graph schema using a Mermaid class diagram. 
@@ -3215,7 +4942,43 @@ async def async_main() -> None:
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8000"))
-    instructions = os.getenv("INSTRUCTIONS", "Query the GeneLab KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data.")
+    # The server-level `instructions` string is surfaced by most MCP clients
+    # (Claude Desktop, Claude.ai, Cursor, Cline, etc.) as system-prompt-level
+    # guidance the LLM sees BEFORE deciding which tool to call. Use it to set a
+    # global tool-selection policy so the specialist tools win over the
+    # general-purpose `query` tool for the categories they cover. Without this,
+    # clients will often reach for `query` because its docstring promises raw
+    # Cypher access while the specialists' docstrings promise narrower outputs.
+    DEFAULT_INSTRUCTIONS = (
+        "Query the GeneLab KG for NASA spaceflight omics datasets: differential "
+        "gene expression (RNA-Seq), DNA methylation (WGBS/methylKit), and microbial "
+        "abundance (DESeq2/ANCOM-BC).\n"
+        "\n"
+        "TOOL SELECTION POLICY (must be followed):\n"
+        "- For 'up/down-regulated genes', 'DEGs', 'differential expression', or any\n"
+        "  per-assay log2fc question: ALWAYS call find_differentially_expressed_genes;\n"
+        "  NEVER call the `query` tool for this.\n"
+        "- For 'hyper/hypo-methylated regions', 'DMRs', methylation_diff rankings,\n"
+        "  promoter/exon/intron-filtered methylation queries, or pooling methylation\n"
+        "  across replicate assays: ALWAYS call find_differentially_methylated_regions;\n"
+        "  NEVER call the `query` tool for this.\n"
+        "- For 'differentially abundant organisms' or DESeq2/ANCOM-BC abundance:\n"
+        "  ALWAYS call find_differentially_abundant_organisms; NEVER call `query`.\n"
+        "- For study metadata, factor space, or 'what assays does study X have':\n"
+        "  ALWAYS call get_study_info or select_assays; NEVER call `query`.\n"
+        "- For comparing DEGs/DMRs/DA organisms across multiple assays: use the\n"
+        "  matching find_common_* tool, NEVER the `query` tool.\n"
+        "- For DE genes overlapping DM regions (expression-methylation coupling):\n"
+        "  use find_common_de_genes_overlapping_dm_regions, NEVER `query`.\n"
+        "\n"
+        "The `query` tool is a fallback for ad-hoc Cypher only. The specialist tools\n"
+        "additionally return formatted markdown tables and inline CSVs that `query`\n"
+        "does not produce; falling back to `query` for the categories above loses\n"
+        "both the formatting and the CSV side-channel and reproduces work the\n"
+        "specialists already do correctly (parameter validation, parallel queries,\n"
+        "method-aware significance filtering, region-vs-gene aggregation, etc.)."
+    )
+    instructions = os.getenv("INSTRUCTIONS", DEFAULT_INSTRUCTIONS)
 
     logger.info(f"Starting mcp-genelab server (transport={transport})")
     logger.info(f"Neo4j: {db_url}, database: {database}")

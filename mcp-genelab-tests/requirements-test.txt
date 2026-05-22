@@ -1,0 +1,24 @@
+# Test-only dependencies for mcp-genelab.
+#
+# Runtime dependencies (mcp, neo4j, matplotlib, etc.) are pulled in via the
+# package's main install. This file adds only what the tests need on top.
+#
+# Pins are loose lower-bounds: the tests check shape/interface contracts
+# that are stable across reasonable version ranges. If a future major
+# release of pydantic or fastmcp changes the JSON Schema shape for
+# Optional[int], that's a real regression we want to know about — so we
+# don't pin upper bounds defensively.
+
+pytest>=7.0
+pytest-asyncio>=0.21  # not strictly used (we asyncio.run() ourselves) but harmless
+
+# These are runtime deps duplicated here so a developer running just
+# `pip install -r requirements-test.txt` can run the suite without first
+# installing the main package. Listing them keeps the CI workflow simpler.
+mcp>=1.0
+neo4j>=5.0
+pydantic>=2.0
+matplotlib>=3.7
+matplotlib-venn>=0.11
+adjustText>=0.7
+numpy>=1.24
