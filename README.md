@@ -262,6 +262,11 @@ For production deployment with TLS and network isolation, see the [AWS Deploymen
 
 [OSD-267 DA analysis]()
 
+### Cross-Graph Differential Expression and Associated Disease Analysis with MCP tools
+
+[OSD-161 DE and spoke-okn disease analysis]()
+
+>*Note: To perform this example query, you will need to add the NSF OKN MCP server to your MCP client by following the instructions at [https://okn.us/mcp](https://okn.us/mcp).* 
 
 ---
 
