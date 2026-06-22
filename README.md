@@ -5,7 +5,7 @@
 [![Model Context Protocol](https://img.shields.io/badge/MCP-Compatible-green.svg)](https://modelcontextprotocol.io/)
 [![PyPI version](https://img.shields.io/pypi/v/mcp-genelab?label=PyPI)](https://pypi.org/project/mcp-genelab/)
 
-A Model Context Protocol (MCP) server that converts natural language queries into [Cypher](https://neo4j.com/product/cypher-graph-query-language) queries and executes them against the configured Neo4j endpoints. Customized tools provide seamless access to the NASA [GeneLab Knowledge Graph](https://github.com/BaranziniLab/spoke_genelab) (v0.3.1), enabling AI-assisted analysis of spaceflight experiments and their biological effects. This server allows researchers to query differential gene expression, DNA methylation, and differential organism abundance data from NASA's space biology experiments through natural language interactions with AI assistants like Claude.
+A Model Context Protocol (MCP) server that converts natural language queries into [Cypher](https://neo4j.com/product/cypher-graph-query-language) queries and executes them against the configured Neo4j endpoints. Customized tools provide seamless access to the NASA [GeneLab Knowledge Graph](https://github.com/BaranziniLab/spoke_genelab) (spoke-genelab v0.3.1), enabling AI-assisted analysis of spaceflight experiments and their biological effects. This server allows researchers to query differential gene expression, DNA methylation, and differential organism abundance data from NASA's space biology experiments through natural language interactions with AI assistants like Claude.
 
 The GeneLab Knowledge Graph integrates omics data from NASA's [Open Science Data Repository (OSDR)](https://science.nasa.gov/biological-physical/data/osdr/), with nodes that can be used as connectors to other knowledge graphs, such as the [SPOKE](https://spoke.ucsf.edu/) (Scalable Precision Medicine Open Knowledge Engine) knowledge graph. This integration connects spaceflight experimental results with a comprehensive biological context, including genes, proteins, anatomical structures, pathways, and diseases.
 
@@ -63,50 +63,72 @@ The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types:
 - **Remote Deployment**: Deploy as a web service behind a TLS reverse proxy, accessible via HTTPS URL from any MCP client
 - **Docker Support**: Build and deploy as a Docker container for consistent, reproducible environments
 - **Multiple Access Methods**: Use through Claude Desktop, VS Code with GitHub Copilot, or any MCP-compatible client
-- **Pre-configured Endpoints**: Ready-to-use access to both local and remote Neo4j databases containing the GeneLab Knowledge Graph
+- **Pre-configured Setup**: Ready-to-use mcp-genelab configuration files for a local STDIO connection to the spoke-genelab-v0.3.1 KG (a remote public endpoint is coming soon)
 
 ## Prerequisites
 
-Before using the MCP server, ensure you have:
+Before using mcp-genelab, ensure you have:
 
 - **Client Application**: One of the following:
   - Claude Desktop or claude.ai (Pro or Max subscription) — connect via Settings → Connectors → Add Custom Connector
   - VS Code with GitHub Copilot — connect via MCP server settings
-  - Any MCP client that supports Streamable HTTP transport
-- **Neo4j Knowledge Graph** (one of the following):
-  - **Remote access** (easiest): Connect to a hosted instance — [request](https://github.com/asaravia-butler/mcp-genelab/issues) credentials or use the provided HTTPS endpoint
-  - **Local installation**: Run the GeneLab KG in Docker — see [setup](https://github.com/BaranziniLab/spoke_genelab)
+  - Any MCP client that supports the STDIO or Streamable HTTP transport
+- **Connection to the spoke-genelab-v0.3.1 knowledge graph** via one of the two paths below:
+  - **Remote public endpoint** (*coming soon*): Connect to a hosted mcp-genelab server over HTTPS — no local install required. See [Option A](#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon).
+  - **Local install with STDIO**: Run mcp-genelab on your own machine against a local Neo4j instance holding the spoke-genelab-v0.3.1 KG. See [Option B](#option-b-run-mcp-genelab-locally-with-stdio).
 
-For local development or self-hosting, you also need:
+For the local STDIO setup you also need:
 - **Operating System**: macOS, Linux, or Windows
-- **Python 3.10+** and [uv](https://docs.astral.sh/uv/) package manager
-- **Docker** (for containerized deployment)
+- **Python 3.10+** and the [uv](https://docs.astral.sh/uv/) package manager
+- **Neo4j Desktop** with the spoke-genelab-v0.3.1 KG imported (installation links are provided in [Option B](#option-b-run-mcp-genelab-locally-with-stdio))
 
 ## Quick Start
 
-### Option A: Connect to a Remote MCP Server (Recommended)
+mcp-genelab can be reached two ways: by connecting to the **remote public endpoint** (coming soon) or by **running mcp-genelab locally with STDIO**. Both serve the `spoke-genelab-v0.3.1` knowledge graph.
 
-If a hosted MCP server is available, users can connect without installing anything:
+### Option A: Connect to the Remote mcp-genelab Server (coming soon)
+
+> **Status: Coming soon.** A public HTTPS endpoint for mcp-genelab is being prepared. When it is live, the URL will be published here and in the [mcp-genelab repository](https://github.com/sbl-sdsc/mcp-genelab). Until then, use [Option B](#option-b-run-mcp-genelab-locally-with-stdio) to run mcp-genelab locally.
+
+Once the public endpoint is available, you will be able to connect to mcp-genelab without installing anything locally:
 
 1. Open Claude Desktop (or claude.ai)
 2. Go to **Settings → Connectors** (or **Manage Connectors**)
 3. Click **Add Custom Connector**
 4. Enter:
-   - **Name**: `GeneLab KG`
-   - **MCP Server URL**: `https://genelab-mcp.yourdomain.com/mcp/` *(replace with actual URL)*
+   - **Name**: `mcp-genelab`
+   - **MCP Server URL**: *the public mcp-genelab endpoint (coming soon)*
 5. Click **Save**
-6. In the chat prompt, click the **+** button and toggle the **GeneLab KG** connector **on**
+6. In the chat prompt, click the **+** button and toggle the **mcp-genelab** connector **on**
 
-Then ask a question like: *"What organisms are represented in the GeneLab experiments?"*
+Then ask a question like: *"What organisms are represented in the spoke-genelab-v0.3.1 knowledge graph?"*
 
-### Option B: Run Locally with STDIO
+### Option B: Run mcp-genelab Locally with STDIO
 
-Install `uv` if you don't have it:
+Running mcp-genelab locally has two parts: (1) stand up a local Neo4j instance holding the `spoke-genelab-v0.3.1` KG, and (2) point mcp-genelab at it via STDIO.
+
+#### Step 1 — Install Neo4j Desktop and import the spoke-genelab-v0.3.1 KG
+
+1. **Install Neo4j Desktop** and create a `spoke-genelab` instance (with the APOC plugin) by following the [Neo4j Desktop installation instructions](https://github.com/BaranziniLab/spoke_genelab/blob/main/docs/neo4j_installation.md).
+2. **Import the spoke-genelab-v0.3.1 KG** into that instance by following the [database import instructions](https://github.com/BaranziniLab/spoke_genelab/blob/main/docs/import_db.md). Name the database exactly `spoke-genelab-v0.3.1` and start the instance once the import completes.
+
+Note the Bolt URI (default `bolt://localhost:7687`), username, and password of your running instance — you will need them in Step 2.
+
+#### Step 2 — Install `uv` and configure mcp-genelab
+
+Install `uv` if you don't already have it:
+
 ```bash
+# macOS/Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Then configure your MCP client. For Claude Desktop, go to `Claude → Settings → Developer → Edit Config` and add:
+```powershell
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then configure your MCP client to launch mcp-genelab over STDIO. For **Claude Desktop**, go to `Claude → Settings → Developer → Edit Config` and  the following mcp-genelab entry:
 
 ```json
 {
@@ -118,17 +140,15 @@ Then configure your MCP client. For Claude Desktop, go to `Claude → Settings �
         "NEO4J_URI": "bolt://localhost:7687",
         "NEO4J_USERNAME": "neo4j",
         "NEO4J_PASSWORD": "neo4jdemo",
-        "NEO4J_DATABASE": "neo4j",
-        "INSTRUCTIONS": "Query the GeneLab KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
+        "NEO4J_DATABASE": "spoke-genelab-v0.3.1",
+        "INSTRUCTIONS": "Query the spoke-genelab-v0.3.1 KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
       }
     }
   }
 }
 ```
 
-> **Note**: When running the GeneLab KG locally in Docker with Community Edition, set `NEO4J_DATABASE` to `neo4j` (the default database name). When connecting to a remote Neo4j instance that uses named databases, use the appropriate database name (e.g., `spoke-genelab-v0.3.1`).
-
-For VS Code with GitHub Copilot, add to your `.vscode/mcp.json`:
+For **VS Code with GitHub Copilot**, add the same mcp-genelab entry to your `.vscode/mcp.json` (note the top-level key is `servers`, not `mcpServers`):
 
 ```json
 {
@@ -140,13 +160,15 @@ For VS Code with GitHub Copilot, add to your `.vscode/mcp.json`:
         "NEO4J_URI": "bolt://localhost:7687",
         "NEO4J_USERNAME": "neo4j",
         "NEO4J_PASSWORD": "neo4jdemo",
-        "NEO4J_DATABASE": "neo4j",
-        "INSTRUCTIONS": "Query the GeneLab KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
+        "NEO4J_DATABASE": "spoke-genelab-v0.3.1",
+        "INSTRUCTIONS": "Query the spoke-genelab-v0.3.1 KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
       }
     }
   }
 }
 ```
+
+> **Note**: Set `NEO4J_USERNAME`, `NEO4J_PASSWORD`, and `NEO4J_URI` to match the Neo4j instance you started in Step 1. The `uvx` command automatically downloads and runs the latest published mcp-genelab from PyPI. Keep `NEO4J_DATABASE` set to `spoke-genelab-v0.3.1` to match the database name you imported.
 
 ### Configure MCP Tools (Claude Desktop)
 
@@ -167,7 +189,7 @@ In the prompt dialog box, click the `+` button:
      alt="Tool Selector"
      width="300">
 
-Use @kg_name to refer to a specific knowledge graph in chat (for example, @spoke-genelab).
+Use @kg_name to refer to a specific mcp server (for example, @mcp-genelab).
 
 To create a transcript of a chat (see examples below), use the following prompt: 
 ```Create a chat transcript```. 
@@ -191,7 +213,7 @@ docker run \
   --env NEO4J_URI=bolt://host.docker.internal:7687 \
   --env NEO4J_USERNAME=neo4j \
   --env NEO4J_PASSWORD=yourpassword \
-  --env NEO4J_DATABASE=neo4j \
+  --env NEO4J_DATABASE=spoke-genelab-v0.3.1 \
   --env MCP_TRANSPORT=streamable-http \
   --env MCP_HOST=0.0.0.0 \
   --env MCP_PORT=8000 \
@@ -210,7 +232,7 @@ For production deployment with TLS and network isolation, see the [AWS Deploymen
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j Bolt connection URI |
 | `NEO4J_USERNAME` | `neo4j` | Neo4j username |
 | `NEO4J_PASSWORD` | `neo4jdemo` | Neo4j password |
-| `NEO4J_DATABASE` | `spoke-genelab-v0.3.1` | Neo4j database name (use `neo4j` for Community Edition) |
+| `NEO4J_DATABASE` | `spoke-genelab-v0.3.1` | Neo4j database name for the spoke-genelab-v0.3.1 KG |
 | `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, `streamable-http`, or `http` |
 | `MCP_HOST` | `127.0.0.1` | HTTP listener host (use `0.0.0.0` for Docker) |
 | `MCP_PORT` | `8000` | HTTP listener port |
@@ -218,27 +240,28 @@ For production deployment with TLS and network isolation, see the [AWS Deploymen
 
 ## Example Queries
 
-### Knowledge Graph Overviews & Class Diagrams
+*Each link below points to a chat transcript that demonstrates how to use the mcp-genelab server to query and analyze GeneLab data hosted in the spoke-genelab-v0.3.1 Neo4j Knowledge Graph.*
 
-Each link below points to a chat transcript that demonstrates how to generate a knowledge-graph overview and class diagram for a given Neo4j Knowledge Graph.
+### Knowledge Graph Overview & Class Diagram 
 
-[spoke-genelab](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/examples/spoke-genelab-overview.md)
-
-[spoke-okn](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/examples/spoke-okn-overview.md)
+[Overview of spoke-genelab v0.3.1]() 
 
 ### Node and Relationship Metadata Examples
 
-[spoke-genelab: Assay Node Metadata](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/examples/assay-node-description.md)
-
-[spoke-genelab: MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG relationship](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/examples/differential-expression-relationship.md)
-
-### SPOKE-GeneLab KG Inventory
-
-[spoke-genelab Inventory](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/examples/genelab-inventory.md)
+[List spoke-genelab-v0.3.1 assay node, properties, and relationships]() 
 
 ### Differential Expression Analysis with MCP tools
 
-[spoke-genelab Study OSD-244](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/examples/osd-244-differential-gene-expression.md)
+[OSD-244 DE analysis]()
+
+### Differential Expression and Differential Methylation Analysis with MCP tools                                                                                                                 
+
+[OSD-48 DE and DM analysis]() 
+
+### Differential Abundance Analysis with MCP tools
+
+[OSD-267 DA analysis]()
+
 
 ---
 
@@ -326,11 +349,11 @@ As a second layer of defense, the `query` tool includes a regex-based write filt
 The project ships a pytest suite (95 tests across 8 files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), and the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees).
 
 ```bash
-pip install -r requirements-test.txt
+pip install -r mcp-genelab-tests/requirements-test.txt
 pytest
 ```
 
-The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHub Actions workflow at `.github/workflows/test.yml` runs the suite on Python 3.10 through 3.13 for every push and pull request. See `tests/README.md` for the per-file breakdown and instructions on adding tests for new tools.
+The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHub Actions workflow at `.github/workflows/test.yml` runs the suite on Python 3.10 through 3.13 for every push and pull request. See `mcp-genelab-tests/tests/README.md` for the per-file breakdown and instructions on adding tests for new tools.
 
 ## Building and Publishing (maintainers only)
 
@@ -351,8 +374,8 @@ The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHu
 
 **Connection errors:**
 - Verify the Neo4j endpoint URL is correct and accessible
-- For local Docker deployments, ensure the Neo4j container is running and healthy: `docker logs genelab-kg`
-- Check that `NEO4J_DATABASE` is set to `neo4j` for Community Edition (not `spoke-genelab-v0.3.1`)
+- For a local Neo4j Desktop instance, ensure the `spoke-genelab` instance is started and the `spoke-genelab-v0.3.1` database has finished loading
+- Check that `NEO4J_DATABASE` is set to `spoke-genelab-v0.3.1` and matches the database name you imported
 
 **Write operation rejected:**
 - This is expected behavior. All sessions use READ_ACCESS mode. Write operations (CREATE, MERGE, SET, DELETE) are blocked at the Bolt protocol level.
@@ -402,12 +425,12 @@ This work is supported in part by:
 ### Related Projects
 
 - [Proto-OKN Project](https://www.proto-okn.net/) - Prototype Open Knowledge Network initiative
-- [NASA Open Science Data Repository (OSDR)](https://science.nasa.gov/biological-physical/data/osdr/) - Repository of multi-modal space life science data
-- [NASA GeneLab Data Repository](https://genelab.nasa.gov/) - GeneLab data repository used to create the GeneLab KG
-- [NASA GeneLab KG](https://github.com/BaranziniLab/spoke_genelab) - Git Repository for creating the GeneLab KG
+- [NSF Open Knowledge Network](https://okn.us/) - 40+ intercnnected knowledge graphs supported by NSF
+- [NASA Open Science Data Repository (OSDR)](https://osdr.nasa.gov/bio/repo) - Repository of multi-modal space life science data
+- [NASA GeneLab KG, spoke-genelab](https://github.com/BaranziniLab/spoke_genelab) - Git Repository for creating the spoke-geneLab KG v0.3.1
 - [Model Context Protocol](https://modelcontextprotocol.io/) - AI assistant integration standard
 - [Original Neo4j Cypher MCP server](https://github.com/neo4j-contrib/mcp-neo4j/tree/main/servers/mcp-neo4j-cypher) - Base implementation reference
 
 ---
 
-*For questions, issues, or contributions, please visit our [GitHub repository](https://github.com/asaravia-butler/mcp-genelab).*
+*For questions, issues, or contributions, please visit our [GitHub repository](https://github.com/sbl-sdsc/mcp-genelab).*

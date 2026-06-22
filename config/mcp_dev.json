@@ -1,6 +1,6 @@
 {
   "servers": {
-    "spoke-genelab-local-dev": {
+    "mcp-genelab-local-dev": {
       "command": "uv",
       "args": ["run", "--directory", "/Users/.../mcp-genelab", "mcp-genelab"],
       "env": {
@@ -8,10 +8,10 @@
         "NEO4J_USERNAME": "neo4j",
         "NEO4J_PASSWORD": "neo4jdemo",
         "NEO4J_DATABASE": "spoke-genelab-v0.3.1",
-        "INSTRUCTIONS": "Query the GeneLab KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
+        "INSTRUCTIONS": "Query the spoke-genelab-v0.3.1 KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
       }
     },
-    "spoke-genelab-dev": {
+    "mcp-genelab-dev": {
       "command": "uv",
       "args": ["run", "--directory", "/Users/.../mcp-genelab", "mcp-genelab"],
       "env": {
@@ -19,40 +19,7 @@
         "NEO4J_USERNAME": "username",
         "NEO4J_PASSWORD": "password",
         "NEO4J_DATABASE": "spoke-genelab-v0.3.1",
-        "INSTRUCTIONS": "Query the GeneLab KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
-      }
-    },
-    "humanspoke-dev": {
-      "command": "uv",
-      "args": ["run", "--directory", "/Users/.../mcp-genelab", "mcp-genelab"],
-      "env": {
-        "NEO4J_URI": "uri",
-        "NEO4J_USERNAME": "username",
-        "NEO4J_PASSWORD": "password",
-        "NEO4J_DATABASE": "humanspoke",
-        "INSTRUCTIONS": "Query the humanspoke KG for human biomedical data, including genes, proteins, compounds, pathways, symptoms, and diseases."
-      }
-    },
-    "spoke-dev": {
-      "command": "uv",
-      "args": ["run", "--directory", "/Users/.../mcp-genelab", "mcp-genelab"],
-      "env": {
-        "NEO4J_URI": "uri",
-        "NEO4J_USERNAME": "username",
-        "NEO4J_PASSWORD": "password",
-        "NEO4J_DATABASE": "spoke",
-        "INSTRUCTIONS": "Query the spoke KG for human and microbial data, including genes, proteins, compounds, pathways, symptoms, and diseases."
-      }
-    },
-    "spoke-okn-dev": {
-      "command": "uv",
-      "args": ["run", "--directory", "/Users/.../mcp-genelab", "mcp-genelab"],
-      "env": {
-        "NEO4J_URI": "uri",
-        "NEO4J_USERNAME": "username",
-        "NEO4J_PASSWORD": "password",
-        "NEO4J_DATABASE": "spokeokn",
-        "INSTRUCTIONS": "Query the spoke-okn KG to retrieve data on social determinants of health, including disease prevalence, mortality rates, and environmental compound exposure across geographic regions."
+        "INSTRUCTIONS": "Query the spoke-genelab-v0.3.1 KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
       }
     }
   }

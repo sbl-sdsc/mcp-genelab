@@ -1,8 +1,19 @@
 ## Installation
 
+These instructions cover installing and running **mcp-genelab** locally with the STDIO transport against the **spoke-genelab-v0.3.1** knowledge graph. (A remote public mcp-genelab endpoint is *coming soon*; when available it will be documented in the [README](../README.md).)
+
+### Set up the spoke-genelab-v0.3.1 knowledge graph
+
+Before configuring mcp-genelab, stand up a local Neo4j instance holding the spoke-genelab-v0.3.1 KG:
+
+1. **Install Neo4j Desktop** and create a `spoke-genelab` instance with the APOC plugin by following the [Neo4j Desktop installation instructions](https://github.com/BaranziniLab/spoke_genelab/blob/main/docs/neo4j_installation.md).
+2. **Import the spoke-genelab-v0.3.1 KG** into that instance by following the [database import instructions](https://github.com/BaranziniLab/spoke_genelab/blob/main/docs/import_db.md). Name the database exactly `spoke-genelab-v0.3.1` and start the instance.
+
+Note the Bolt URI (default `bolt://localhost:7687`), username, and password — you will use them in the mcp-genelab configuration below.
+
 ### Prerequisites
 
-The MCP GeneLab server requires installing the `uv` package manager on your system. If you don't have it installed, run:
+mcp-genelab requires installing the `uv` package manager on your system. If you don't have it installed, run:
 
 ```bash
 # macOS/Linux
@@ -61,7 +72,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
    **Option A: Download Pre-configured File (Recommended)**
 
-   Download the pre-configured `claude_desktop_config.json` file with Neo4j endpoints from the repository and copy it to the appropriate location:
+   Download the pre-configured `claude_desktop_config.json` file (which configures the mcp-genelab server for the spoke-genelab-v0.3.1 KG) from the repository and copy it to the appropriate location:
 
    **macOS**:
    ```bash
@@ -86,37 +97,27 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
    Alternatively, you can manually edit the configuration file in Claude Desktop. Navigate to `Claude->Settings->Developer->Edit Config`
    to edit it.
 
-   Below is an example of how to configure local and remote Neo4j endpoints. For remotely hosted Neo4j servers, update the url, username, and password.
+   Below is the mcp-genelab STDIO configuration. Set `NEO4J_URI`, `NEO4J_USERNAME`, and `NEO4J_PASSWORD` to match the Neo4j instance holding the spoke-genelab-v0.3.1 KG.
 
    ```json
    {
      "mcpServers": {
-      "genelab-local": {
+       "mcp-genelab": {
          "command": "uvx",
          "args": ["mcp-genelab"],
          "env": {
            "NEO4J_URI": "bolt://localhost:7687",
            "NEO4J_USERNAME": "neo4j",
            "NEO4J_PASSWORD": "neo4jdemo",
-           "NEO4J_DATABASE": "spoke-genelab-v0.0.4",
-           "INSTRUCTIONS": "Query the GeneLab Knowledge Graph to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics) and DNA methylation (epigenomics) data."
+           "NEO4J_DATABASE": "spoke-genelab-v0.3.1",
+           "INSTRUCTIONS": "Query the spoke-genelab-v0.3.1 KG to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics), DNA methylation (epigenomics), and Amplicon (metagenomics) data."
          }
-       },
-       "genelab": {
-         "command": "uvx",
-         "args": ["mcp-genelab"],
-         "env": {
-           "NEO4J_URI": "uri",
-           "NEO4J_USERNAME": "username",
-           "NEO4J_PASSWORD": "password",
-           "NEO4J_DATABASE": "spoke-genelab-v0.0.4",
-           "INSTRUCTIONS": "Query the GeneLab Knowledge Graph to identify NASA spaceflight experiments containing omics datasets, specifically differential gene expression (transcriptomics) and DNA methylation (epigenomics) data."
-         }
-      }
+       }
+     }
    }
    ```
 
-   > **Important**: If you have existing MCP server configurations, do not use Option A as it will overwrite your existing configuration. Instead, use Option B and manually merge the Neo4j endpoints with your existing `mcpServers` configuration.
+   > **Important**: If you have existing MCP server configurations, do not use Option A as it will overwrite your existing configuration. Instead, use Option B and manually merge the mcp-genelab entry into your existing `mcpServers` configuration.
 
 3. **Restart Claude Desktop**
 
@@ -126,8 +127,8 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
    1. Launch Claude Desktop
    2. Navigate to `Claude->Settings->Connectors`
-   3. Verify that the configured Neo4j endpoints appear in the connector list
-   4. You can configure each service to always ask for permission or to run it unsupervised (recommended)
+   3. Verify that the `mcp-genelab` connector appears in the connector list
+   4. You can configure mcp-genelab to always ask for permission or to run it unsupervised (recommended)
 
 ### VS Code Setup
 
@@ -151,7 +152,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
    **Option A: Download Pre-configured File (Recommended)**
 
-   Download the pre-configured `mcp.json` file from the repository and copy it to the appropriate location.
+   Download the pre-configured `mcp.json` file (mcp-genelab configured for the spoke-genelab-v0.3.1 KG) from the repository and copy it to the appropriate location.
 
    **macOS**:
    ```bash
@@ -168,4 +169,4 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
    1. Open a new chat window in VS Code
    2. Select **Agent** mode
    3. Choose **Claude Sonnet 4.5 or later** model for optimal performance
-   4. The MCP servers will automatically connect and provide knowledge graph access
+   4. mcp-genelab will automatically connect and provide access to the spoke-genelab-v0.3.1 knowledge graph
