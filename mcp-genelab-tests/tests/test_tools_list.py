@@ -1,7 +1,7 @@
 """Tools-list inspection tests.
 
 What this file guards:
-  - All 21 expected tools register correctly with FastMCP.
+  - All 22 expected tools register correctly with FastMCP.
   - Every tool has a `title` annotation (human-readable, shown by clients).
   - Every tool declares readOnlyHint, idempotentHint, and openWorldHint —
     the three behavioral hints from the MCP spec that clients use for
@@ -43,7 +43,7 @@ EXPECTED_TOOLS = {
 
 
 def test_expected_tool_count(tools_list):
-    """21 tools are expected. A higher number means an undocumented tool was
+    """22 tools are expected. A higher number means an undocumented tool was
     added; a lower number means one was removed or failed to register."""
     assert len(tools_list) == len(EXPECTED_TOOLS), (
         f"Expected {len(EXPECTED_TOOLS)} tools, got {len(tools_list)}: "
