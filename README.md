@@ -64,9 +64,7 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
 
 ## Building and Querying the SPOKE-GeneLab Knowledge Graph
 
-### [Video](https://www.youtube.com/watch?v=bCgffFYEE3M)
-
-### [Presentation](https://nebigdatahub.org/wp-content/uploads/2026/01/SPOKE-Genelab-Technical-Review.pdf)
+### [Presentation](https://docs.google.com/presentation/d/1MOtXGO1_FGMIfZO1Fwd4B5hv2GZGweEpJrOCBpjsmLw)
 
 ## Knowledge Graph Schema (v0.3.1)
 
@@ -236,7 +234,7 @@ In the prompt dialog box, click the `+` button:
 2. Toggle MCP services on/off as needed
 ```
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/main/docs/images/select_mcp_server.png"
+<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/blob/DEV/docs/images/select_mcp_server.png"
      alt="Tool Selector"
      width="300">
 
@@ -274,7 +272,6 @@ docker run \
 
 The MCP server is then accessible at `http://localhost:8000/mcp/`.
 
-For production deployment with TLS and network isolation, see the [AWS Deployment Guide](DEPLOYMENT.md).
 
 ### Environment Variables
 
@@ -311,7 +308,7 @@ For production deployment with TLS and network isolation, see the [AWS Deploymen
 
 ### Differential Abundance Analysis with MCP tools
 
-[OSD-267 DA analysis](docs/examples/)
+[OSD-267 DA analysis](docs/examples/OSD-267_DA_pubmed.md)
 
 ### Cross-Graph Differential Expression and Associated Disease Analysis with MCP tools
 
@@ -398,7 +395,7 @@ As a second layer of defense, the `query` tool includes a regex-based write filt
 
 ## Development
 
-[Instructions for local development](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/development.md)
+[Instructions for local development](docs/development.md)
 
 ## Testing
 
@@ -413,11 +410,11 @@ The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHu
 
 ## Building and Publishing (maintainers only)
 
-[Instructions for building, testing, and publishing the mcp-genelab package on PyPI](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/build_publish.md)
+[Instructions for building, testing, and publishing the mcp-genelab package on PyPI](docs/build_publish.md)
 
 ## API Reference
 
-[mcp-genelab server API](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/api.md)
+[mcp-genelab server API](docs/api.md)
 
 ## Troubleshooting
 
