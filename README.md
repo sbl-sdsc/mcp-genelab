@@ -234,9 +234,10 @@ In the prompt dialog box, click the `+` button:
 2. Toggle MCP services on/off as needed
 ```
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/blob/DEV/docs/images/select_mcp_server.png"
-     alt="Tool Selector"
-     width="300">
+<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/refs/heads/DEV/docs/images/select_mcp_server.png"
+     alt="tool selector"
+     width="600">
+
 
 Use @kg_name to refer to a specific mcp server (for example, @mcp-genelab).
 
