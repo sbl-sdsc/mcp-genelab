@@ -295,27 +295,27 @@ For production deployment with TLS and network isolation, see the [AWS Deploymen
 
 ### Knowledge Graph Overview & Class Diagram 
 
-[Overview of spoke-genelab v0.3.1]() 
+[Overview of spoke-genelab v0.3.1](docs/examples/MCP-GL_KG_overview.md) 
 
 ### Node and Relationship Metadata Examples
 
-[List spoke-genelab-v0.3.1 assay node, properties, and relationships]() 
+[List spoke-genelab-v0.3.1 assay node, properties, and relationships](docs/examples/MCP-GL_AssayNode_DEedge.md) 
 
 ### Differential Expression Analysis with MCP tools
 
-[OSD-244 DE analysis]()
+[OSD-244 DE analysis](docs/examples/OSD-244_DE.md)
 
 ### Differential Expression and Differential Methylation Analysis with MCP tools                                                                                                                 
 
-[OSD-48 DE and DM analysis]() 
+[OSD-48 DE and DM analysis](docs/examples/OSD-48_DE_DM_pubmed.md) 
 
 ### Differential Abundance Analysis with MCP tools
 
-[OSD-267 DA analysis]()
+[OSD-267 DA analysis](docs/examples/)
 
 ### Cross-Graph Differential Expression and Associated Disease Analysis with MCP tools
 
-[OSD-161 DE and spoke-okn disease analysis]()
+[OSD-161 DE and spoke-okn disease analysis](docs/examples/OSD-161_DE_proto-okn.md)
 
 >*Note: To perform this example query, you will need to add the NSF OKN MCP server to your MCP client by following the instructions at [https://okn.us/mcp](https://okn.us/mcp).* 
 
