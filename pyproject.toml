@@ -1,7 +1,7 @@
 [project]
 name = "mcp-genelab"
-version = "0.4.0"
-description = "MCP server for querying Neo4j Knowledge Graphs with custom tools for quering GeneLab"
+version = "0.5.0"
+description = "MCP server for querying the NASA GeneLab Knowledge Graph with specialist tools for differential gene expression, DNA methylation, and organism abundance analyses (per-assay and cross-assay), plus DE/DM overlap detection, volcano and Venn plotting, and resource-based plot delivery."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "BSD-3-Clause" }
@@ -16,7 +16,7 @@ dependencies = [
     "numpy",
     "matplotlib",
     "matplotlib-venn",
-    "adjusttext",
+    "adjustText",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,6 +25,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 [project.urls]

@@ -1,0 +1,121 @@
+classDiagram
+    direction TB
+
+    class Mission {
+        STRING name
+        STRING identifier
+        STRING flight_program
+        STRING space_program
+        DATE start_date
+        DATE end_date
+    }
+
+    class Study {
+        STRING name
+        STRING identifier
+        STRING description
+        STRING project_title
+        STRING project_type
+        STRING organism
+        STRING taxonomy
+        STRING host_organism
+        STRING host_strain
+        STRING host_taxonomy
+    }
+
+    class Assay {
+        STRING name
+        STRING identifier
+        STRING technology
+        STRING measurement
+        STRING differential_analysis_method
+        STRING factor_space_1
+        STRING factor_space_2
+        LIST factors_1
+        LIST factors_2
+        STRING material_1
+        STRING material_2
+        STRING material_name_1
+        STRING material_name_2
+        STRING material_id_1
+        STRING material_id_2
+    }
+
+    class MGene {
+        STRING name
+        STRING identifier
+        STRING symbol
+        STRING organism
+        STRING taxonomy
+    }
+
+    class Gene {
+        STRING identifier
+    }
+
+    class MethylationRegion {
+        STRING name
+        STRING identifier
+        STRING chromosome
+        INTEGER start
+        INTEGER end
+        BOOLEAN in_exon
+        BOOLEAN in_intron
+        BOOLEAN in_promoter
+        INTEGER dist_to_feature
+    }
+
+    class Organism {
+        STRING name
+        STRING identifier
+    }
+
+    class Anatomy {
+        STRING identifier
+    }
+
+    class CellType {
+        STRING identifier
+    }
+
+    class MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG {
+        float log2fc
+        float adj_p_value
+        float group_mean_1
+        float group_mean_2
+        float group_stdev_1
+        float group_stdev_2
+    }
+
+    class MEASURED_DIFFERENTIAL_METHYLATION_ASmMR {
+        float methylation_diff
+        float q_value
+        float group_mean_1
+        float group_mean_2
+        float group_stdev_1
+        float group_stdev_2
+    }
+
+    class MEASURED_DIFFERENTIAL_ABUNDANCE_ASmO {
+        float log2fc
+        float lnfc
+        float adj_p_value
+        float q_value
+        float group_mean_1
+        float group_mean_2
+        float group_stdev_1
+        float group_stdev_2
+    }
+
+    Mission --> Study : CONDUCTED_MIcS
+    Study --> Assay : PERFORMED_SpAS
+    Assay --> MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG
+    MEASURED_DIFFERENTIAL_EXPRESSION_ASmMG --> MGene
+    Assay --> MEASURED_DIFFERENTIAL_METHYLATION_ASmMR
+    MEASURED_DIFFERENTIAL_METHYLATION_ASmMR --> MethylationRegion
+    Assay --> MEASURED_DIFFERENTIAL_ABUNDANCE_ASmO
+    MEASURED_DIFFERENTIAL_ABUNDANCE_ASmO --> Organism
+    Assay --> Anatomy : INVESTIGATED_ASiA
+    Assay --> CellType : INVESTIGATED_ASiCT
+    MGene --> MethylationRegion : METHYLATED_IN_MGmMR
+    MGene --> Gene : IS_ORTHOLOG_MGiG
