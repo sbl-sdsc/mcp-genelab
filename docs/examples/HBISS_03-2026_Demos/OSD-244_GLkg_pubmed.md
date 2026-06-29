@@ -353,7 +353,7 @@ Create volcano plots for these comparisons
 - **6,281 genes** analyzed | **947 upregulated** | **899 downregulated**
 - Notable outliers: *Ifi27l2a* and *Gp5* (highly significant upregulation); *Vmn2r53* and *Pcsk1* (highly significant downregulation). Immune and interferon-related genes dominate the top hits.
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/main/docs/examples/HBISS_03-2026_Demos/images/GLDS-244_30d_volcano.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/HBISS_03-2026_Demos/images/GLDS-244_30d_volcano.png" 
      alt="volcano 30 days" 
      width="800">
 
@@ -361,7 +361,7 @@ Create volcano plots for these comparisons
 - **2,885 genes** analyzed | **1,386 upregulated** | **67 downregulated**
 - Strikingly asymmetric — strong bias toward upregulation. *Krt4* and *Krt13* stand out with both high fold change and exceptional statistical significance (adj p ~10⁻⁸).
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/main/docs/examples/HBISS_03-2026_Demos/images/GLDS-244_60d_volcano.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/HBISS_03-2026_Demos/images/GLDS-244_60d_volcano.png" 
      alt="volcano 60 days" 
      width="800">
 
@@ -399,7 +399,7 @@ create a Venn diagram to visualize these overlaps
 
 🧠 **Assistant**
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/main/docs/examples/HBISS_03-2026_Demos/images/OSD-244_Venn.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/HBISS_03-2026_Demos/images/OSD-244_Venn.png" 
      alt="DGE 30 v 60 days Venn" 
      width="750">
 

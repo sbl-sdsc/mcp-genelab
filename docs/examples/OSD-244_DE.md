@@ -186,14 +186,14 @@ Both volcano plots are rendered below (|log2FC| > 1, adj. p ≤ 0.05).
 
 **~30-day, Earth-return** (Space Flight vs. Ground Control): a roughly **symmetric** volcano — 947 up / 899 down — with both wings well populated. Standout points include *Ifi27l2a*, *Gp5*, *Itga2b* (up) and *Vmn2r53*, *Dlx1as* (down).
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/refs/heads/DEV/docs/examples/images/OSD-244_DE_30d_volcano.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/images/OSD-244_DE_30d_volcano.png" 
      alt="volcano FLT v GC differential methylation"
      width="800">
 
 
 **~60-day, On ISS** (Space Flight vs. Ground Control): a strikingly **right-skewed** volcano — 1,386 up / only 67 down. The most significant hits sit far up the right wing (*Krt4*, *Krt13*, *Myh8*), with a tight cluster of strongly upregulated metabolic/liver-associated genes (*Gulo*, *Cyp8b1*, *Serpinc1*, *Apoa4*, *F2*) near the top.
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/refs/heads/DEV/docs/examples/images/OSD-244_DE_60d_volcano.png"
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/images/OSD-244_DE_60d_volcano.png"
      alt="volcano FLT v GC differential methylation"
      width="800">
 
@@ -255,7 +255,7 @@ The convergence on coagulation + complement + myeloid inflammation across both a
 
 The Venn diagram is below, split into upregulated (left) and downregulated (right) panels.
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/refs/heads/DEV/docs/examples/images/OSD-244_DE_30d-60d_Venn.png"
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/images/OSD-244_DE_30d-60d_Venn.png"
      alt="volcano FLT v GC differential methylation"
      width="800">
 

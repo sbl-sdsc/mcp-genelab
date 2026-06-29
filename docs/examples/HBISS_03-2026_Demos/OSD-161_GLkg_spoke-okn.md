@@ -114,7 +114,7 @@ All genes shown pass adjusted p-value < 0.05.
 
 ### Volcano Plot
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/main/docs/examples/HBISS_03-2026_Demos/images/OSD-161_SFvGC_volcano.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/HBISS_03-2026_Demos/images/OSD-161_SFvGC_volcano.png" 
      alt="volcano 60 days" 
      width="800">
 
