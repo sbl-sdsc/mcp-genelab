@@ -234,7 +234,7 @@ In the prompt dialog box, click the `+` button:
 2. Toggle MCP services on/off as needed
 ```
 
-<img src="https://raw.githubusercontent.com/asaravia-butler/mcp-genelab/refs/heads/DEV/docs/images/select_mcp_server.png"
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/images/select_mcp_server.png"
      alt="tool selector"
      width="600">
 
@@ -293,27 +293,27 @@ The MCP server is then accessible at `http://localhost:8000/mcp/`.
 
 ### Knowledge Graph Overview & Class Diagram 
 
-[Overview of spoke-genelab v0.3.1](docs/examples/MCP-GL_KG_overview.md) 
+[Overview of spoke-genelab v0.3.1](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/MCP-GL_KG_overview.md) 
 
 ### Node and Relationship Metadata Examples
 
-[List spoke-genelab-v0.3.1 assay node, properties, and relationships](docs/examples/MCP-GL_AssayNode_DEedge.md) 
+[List spoke-genelab-v0.3.1 assay node, properties, and relationships](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/MCP-GL_AssayNode_DEedge.md) 
 
 ### Differential Expression Analysis with MCP tools
 
-[OSD-244 DE analysis](docs/examples/OSD-244_DE.md)
+[OSD-244 DE analysis](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/OSD-244_DE.md)
 
 ### Differential Expression and Differential Methylation Analysis with MCP tools                                                                                                                 
 
-[OSD-48 DE and DM analysis](docs/examples/OSD-48_DE_DM_pubmed.md) 
+[OSD-48 DE and DM analysis](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/OSD-48_DE_DM_pubmed.md) 
 
 ### Differential Abundance Analysis with MCP tools
 
-[OSD-267 DA analysis](docs/examples/OSD-267_DA_pubmed.md)
+[OSD-267 DA analysis](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/OSD-267_DA_pubmed.md)
 
 ### Cross-Graph Differential Expression and Associated Disease Analysis with MCP tools
 
-[OSD-161 DE and spoke-okn disease analysis](docs/examples/OSD-161_DE_proto-okn.md)
+[OSD-161 DE and spoke-okn disease analysis](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/OSD-161_DE_proto-okn.md)
 
 >*Note: To perform this example query, you will need to add the NSF OKN MCP server to your MCP client by following the instructions at [https://okn.us/mcp](https://okn.us/mcp).* 
 
@@ -396,7 +396,7 @@ As a second layer of defense, the `query` tool includes a regex-based write filt
 
 ## Development
 
-[Instructions for local development](docs/development.md)
+[Instructions for local development](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/development.md)
 
 ## Testing
 
@@ -411,11 +411,11 @@ The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHu
 
 ## Building and Publishing (maintainers only)
 
-[Instructions for building, testing, and publishing the mcp-genelab package on PyPI](docs/build_publish.md)
+[Instructions for building, testing, and publishing the mcp-genelab package on PyPI](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/build_publish.md)
 
 ## API Reference
 
-[mcp-genelab server API](docs/api.md)
+[mcp-genelab server API](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/api.md)
 
 ## Troubleshooting
 
@@ -441,7 +441,7 @@ The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHu
 
 ## License
 
-This project is licensed under the BSD 3-Clause License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the BSD 3-Clause License. See the [LICENSE](https://github.com/sbl-sdsc/mcp-genelab/blob/main/LICENSE) file for details.
 
 ## Citation
 
