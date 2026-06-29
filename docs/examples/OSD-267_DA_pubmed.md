@@ -107,7 +107,7 @@ Called `create_volcano_plot` on `OSD-267-5e9596ea90753f412fec4caf89aced0b` with 
 
 Here's the volcano plot for the ANCOM-BC root comparison (Space Flight root vs. Ground Control root):
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/images/OSD-267_DA_16S_volcano.png"
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/docs/examples/images/OSD-267_DA_16S_volcano.png"
      alt="volcano FLT v GC 16S differential abundance"
      width="800">
 
@@ -194,7 +194,7 @@ Decreased: none.
 
 ### Volcano plot — ANCOM-BC ITS root
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/images/OSD-267_DA_ITS_volcano.png"
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/docs/examples/images/OSD-267_DA_ITS_volcano.png"
      alt="volcano FLT v GC ITS differential abundance"
      width="800">
 

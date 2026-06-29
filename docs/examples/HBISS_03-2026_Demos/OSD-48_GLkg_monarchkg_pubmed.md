@@ -176,7 +176,7 @@ The Venn diagram shows the overlap between the two gene sets for **OSD-48 Space 
 - 🔴 **26 genes** downregulated only
 - 🟣 **9 genes** in both — the overlap genes (*Acaa1a, Cux2, Fgfr2, Galk1, Gzf1, Pcsk4, Per1, Tgm1, Tns2*) are labeled directly in the intersection
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/HBISS_03-2026_Demos/images/OSD-48_Venn.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/docs/examples/HBISS_03-2026_Demos/images/OSD-48_Venn.png" 
      alt="hypermethylation v downregulation Venn" 
      width="750">
 
@@ -191,7 +191,7 @@ Use @monarchkg to explore pathway enrichment for these overlapping genes
 
 Here's the pathway enrichment map for the 9 overlap genes, drawn from Monarch KG / Reactome.
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/HBISS_03-2026_Demos/images/OSD-48_Pthwy_Enr.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/docs/examples/HBISS_03-2026_Demos/images/OSD-48_Pthwy_Enr.png" 
      alt="pathway enrichment map" 
      width="800">
 

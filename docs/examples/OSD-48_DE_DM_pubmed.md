@@ -140,14 +140,14 @@ Both volcano plots for OSD-48, Space Flight vs Ground Control (Carcass, liver):
 
 **Expression** (RNA-Seq, |log2FC| > 1, p ≤ 0.05): 845 features — 113 upregulated (red), 73 downregulated (blue). Cdkn1a (p21) is the standout, alongside Npas2 and Arntl. Downregulated circadian genes Dbp, Per3, Tef sit on the left.
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/images/OSD-48_DE_volcano.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/docs/examples/images/OSD-48_DE_volcano.png" 
      alt="volcano FLT v GC differential expression" 
      width="800">
 
 
 **Methylation** (WGBS, |diff| > 10%, q ≤ 0.05): 2301 regions — 419 hypermethylated (red), 362 hypomethylated (blue). Magel2 (+59%) and Mroh6 (+71%) anchor the hypermethylated side; Dusp28 and Twsg1 are the most hypomethylated. Cnot8 has the smallest q-value overall.
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/images/OSD-48_DM_volcano.png" 
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/docs/examples/images/OSD-48_DM_volcano.png" 
      alt="volcano FLT v GC differential methylation"
      width="800">
 
@@ -199,7 +199,7 @@ Venn diagram for the classical epigenetic-silencing overlap in OSD-48 (Space Fli
 - **Downregulated genes:** 206 total (197 unique)
 - **Overlap:** 9 genes — Acaa1a, Cux2, Fgfr2, Galk1, Gzf1, Pcsk4, Per1, Tgm1, Tns2
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/examples/images/OSD-48_DE-DM_Venn.png"
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/refs/heads/main/docs/examples/images/OSD-48_DE-DM_Venn.png"
      alt="Venn diagram of FLT v GC differential methylation and differential expression overlap"
      width="800">
 
