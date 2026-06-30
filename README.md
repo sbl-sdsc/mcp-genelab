@@ -176,7 +176,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Then configure your MCP client to launch mcp-genelab over STDIO. For **Claude Desktop**, go to `Claude → Settings → Developer → Edit Config`d add the following mcp-genelab entry:
+Then configure your MCP client to launch mcp-genelab over STDIO. For **Claude Desktop**, go to `Claude → Settings → Developer → Edit Config` and add the following mcp-genelab entry:
 
 ```json
 {
