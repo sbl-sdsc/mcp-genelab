@@ -13,54 +13,53 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
 
 ## Table of Contents
 
-- [Building and Querying the SPOKE-GeneLab Knowledge Graph](#building-and-querying-the-spoke-genelab-knowledge-graph)
-  - [Video](#video)
-  - [Presentation](#presentation)
-- [Knowledge Graph Schema (v0.3.1)](#knowledge-graph-schema-v031)
-- [Features](#features)
-  - [Querying & Analysis](#querying--analysis)
-  - [Visualization](#visualization)
-  - [Infrastructure](#infrastructure)
-- [Prerequisites](#prerequisites)
-- [Quick Start](#quick-start)
-  - [Option A: Connect to the Remote mcp-genelab Server (coming soon)](#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon)
-  - [Option B: Run mcp-genelab Locally with STDIO](#option-b-run-mcp-genelab-locally-with-stdio)
-    - [Step 1 — Install Neo4j Desktop and import the spoke-genelab-v0.3.1 KG](#step-1--install-neo4j-desktop-and-import-the-spoke-genelab-v031-kg)
-    - [Step 2 — Install `uv` and configure mcp-genelab](#step-2--install-uv-and-configure-mcp-genelab)
-  - [Configure MCP Tools (Claude Desktop)](#configure-mcp-tools-claude-desktop)
-- [Docker Deployment](#docker-deployment)
-  - [Build the MCP Server Image](#build-the-mcp-server-image)
-  - [Run with Streamable HTTP Transport](#run-with-streamable-http-transport)
-  - [Environment Variables](#environment-variables)
-- [Example Queries](#example-queries)
-  - [Knowledge Graph Overview & Class Diagram](#knowledge-graph-overview--class-diagram)
-  - [Node and Relationship Metadata Examples](#node-and-relationship-metadata-examples)
-  - [Differential Expression Analysis with MCP tools](#differential-expression-analysis-with-mcp-tools)
-  - [Differential Expression and Differential Methylation Analysis with MCP tools](#differential-expression-and-differential-methylation-analysis-with-mcp-tools)
-  - [Differential Abundance Analysis with MCP tools](#differential-abundance-analysis-with-mcp-tools)
-  - [Cross-Graph Differential Expression and Associated Disease Analysis with MCP tools](#cross-graph-differential-expression-and-associated-disease-analysis-with-mcp-tools)
-- [MCP Tools Reference](#mcp-tools-reference)
-  - [Schema & metadata](#schema--metadata)
-  - [Study / assay browsing](#study--assay-browsing)
-  - [Single-assay analyses](#single-assay-analyses)
-  - [Cross-assay analyses](#cross-assay-analyses)
-  - [Cypher fallback](#cypher-fallback)
-  - [Plot generation, delivery, and saving](#plot-generation-delivery-and-saving)
-  - [Output paths](#output-paths)
-  - [Mermaid & transcript utilities](#mermaid--transcript-utilities)
-- [Security](#security)
-- [Development](#development)
-- [Testing](#testing)
-- [Building and Publishing (maintainers only)](#building-and-publishing-maintainers-only)
-- [API Reference](#api-reference)
-- [Troubleshooting](#troubleshooting)
-  - [Common Issues](#common-issues)
-- [License](#license)
-- [Citation](#citation)
-  - [Related Publications](#related-publications)
-- [Acknowledgments](#acknowledgments)
-  - [Funding](#funding)
-  - [Related Projects](#related-projects)
+- [Building and Querying the SPOKE-GeneLab Knowledge Graph](https://github.com/sbl-sdsc/mcp-genelab/tree/main#building-and-querying-the-spoke-genelab-knowledge-graph)
+  - [Presentation](https://github.com/sbl-sdsc/mcp-genelab/tree/main#presentation)
+- [Knowledge Graph Schema (v0.3.1)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#knowledge-graph-schema-v031)
+- [Features](https://github.com/sbl-sdsc/mcp-genelab/tree/main#features)
+  - [Querying & Analysis](https://github.com/sbl-sdsc/mcp-genelab/tree/main#querying--analysis)
+  - [Visualization](https://github.com/sbl-sdsc/mcp-genelab/tree/main#visualization)
+  - [Infrastructure](https://github.com/sbl-sdsc/mcp-genelab/tree/main#infrastructure)
+- [Prerequisites](https://github.com/sbl-sdsc/mcp-genelab/tree/main#prerequisites)
+- [Quick Start](https://github.com/sbl-sdsc/mcp-genelab/tree/main#quick-start)
+  - [Option A: Connect to the Remote mcp-genelab Server (coming soon)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon)
+  - [Option B: Run mcp-genelab Locally with STDIO](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio)
+    - [Step 1 — Install Neo4j Desktop and import the spoke-genelab-v0.3.1 KG](https://github.com/sbl-sdsc/mcp-genelab/tree/main#step-1--install-neo4j-desktop-and-import-the-spoke-genelab-v031-kg)
+    - [Step 2 — Install `uv` and configure mcp-genelab](https://github.com/sbl-sdsc/mcp-genelab/tree/main#step-2--install-uv-and-configure-mcp-genelab)
+  - [Configure MCP Tools (Claude Desktop)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#configure-mcp-tools-claude-desktop)
+- [Docker Deployment](https://github.com/sbl-sdsc/mcp-genelab/tree/main#docker-deployment)
+  - [Build the MCP Server Image](https://github.com/sbl-sdsc/mcp-genelab/tree/main#build-the-mcp-server-image)
+  - [Run with Streamable HTTP Transport](https://github.com/sbl-sdsc/mcp-genelab/tree/main#run-with-streamable-http-transport)
+  - [Environment Variables](https://github.com/sbl-sdsc/mcp-genelab/tree/main#environment-variables)
+- [Example Queries](https://github.com/sbl-sdsc/mcp-genelab/tree/main#example-queries)
+  - [Knowledge Graph Overview & Class Diagram](https://github.com/sbl-sdsc/mcp-genelab/tree/main#knowledge-graph-overview--class-diagram)
+  - [Node and Relationship Metadata Examples](https://github.com/sbl-sdsc/mcp-genelab/tree/main#node-and-relationship-metadata-examples)
+  - [Differential Expression Analysis with MCP tools](https://github.com/sbl-sdsc/mcp-genelab/tree/main#differential-expression-analysis-with-mcp-tools)
+  - [Differential Expression and Differential Methylation Analysis with MCP tools](https://github.com/sbl-sdsc/mcp-genelab/tree/main#differential-expression-and-differential-methylation-analysis-with-mcp-tools)
+  - [Differential Abundance Analysis with MCP tools](https://github.com/sbl-sdsc/mcp-genelab/tree/main#differential-abundance-analysis-with-mcp-tools)
+  - [Cross-Graph Differential Expression and Associated Disease Analysis with MCP tools](https://github.com/sbl-sdsc/mcp-genelab/tree/main#cross-graph-differential-expression-and-associated-disease-analysis-with-mcp-tools)
+- [MCP Tools Reference](https://github.com/sbl-sdsc/mcp-genelab/tree/main#mcp-tools-reference)
+  - [Schema & metadata](https://github.com/sbl-sdsc/mcp-genelab/tree/main#schema--metadata)
+  - [Study / assay browsing](https://github.com/sbl-sdsc/mcp-genelab/tree/main#study--assay-browsing)
+  - [Single-assay analyses](https://github.com/sbl-sdsc/mcp-genelab/tree/main#single-assay-analyses)
+  - [Cross-assay analyses](https://github.com/sbl-sdsc/mcp-genelab/tree/main#cross-assay-analyses)
+  - [Cypher fallback](https://github.com/sbl-sdsc/mcp-genelab/tree/main#cypher-fallback)
+  - [Plot generation, delivery, and saving](https://github.com/sbl-sdsc/mcp-genelab/tree/main#plot-generation-delivery-and-saving)
+  - [Output paths](https://github.com/sbl-sdsc/mcp-genelab/tree/main#output-paths)
+  - [Mermaid & transcript utilities](https://github.com/sbl-sdsc/mcp-genelab/tree/main#mermaid--transcript-utilities)
+- [Security](https://github.com/sbl-sdsc/mcp-genelab/tree/main#security)
+- [Development](https://github.com/sbl-sdsc/mcp-genelab/tree/main#development)
+- [Testing](https://github.com/sbl-sdsc/mcp-genelab/tree/main#testing)
+- [Building and Publishing (maintainers only)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#building-and-publishing-maintainers-only)
+- [API Reference](https://github.com/sbl-sdsc/mcp-genelab/tree/main#api-reference)
+- [Troubleshooting](https://github.com/sbl-sdsc/mcp-genelab/tree/main#troubleshooting)
+  - [Common Issues](https://github.com/sbl-sdsc/mcp-genelab/tree/main#common-issues)
+- [License](https://github.com/sbl-sdsc/mcp-genelab/tree/main#license)
+- [Citation](https://github.com/sbl-sdsc/mcp-genelab/tree/main#citation)
+  - [Related Publications](https://github.com/sbl-sdsc/mcp-genelab/tree/main#related-publications)
+- [Acknowledgments](https://github.com/sbl-sdsc/mcp-genelab/tree/main#acknowledgments)
+  - [Funding](https://github.com/sbl-sdsc/mcp-genelab/tree/main#funding)
+  - [Related Projects](https://github.com/sbl-sdsc/mcp-genelab/tree/main#related-projects)
 
 ## Building and Querying the SPOKE-GeneLab Knowledge Graph
 
@@ -123,13 +122,13 @@ Before using mcp-genelab, ensure you have:
   - VS Code with GitHub Copilot — connect via MCP server settings
   - Any MCP client that supports the STDIO or Streamable HTTP transport
 - **Connection to the spoke-genelab-v0.3.1 knowledge graph** via one of the two paths below:
-  - **Remote public endpoint** (*coming soon*): Connect to a hosted mcp-genelab server over HTTPS — no local install required. See [Option A](#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon).
-  - **Local install with STDIO**: Run mcp-genelab on your own machine against a local Neo4j instance holding the spoke-genelab-v0.3.1 KG. See [Option B](#option-b-run-mcp-genelab-locally-with-stdio).
+  - **Remote public endpoint** (*coming soon*): Connect to a hosted mcp-genelab server over HTTPS — no local install required. See [Option A](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon).
+  - **Local install with STDIO**: Run mcp-genelab on your own machine against a local Neo4j instance holding the spoke-genelab-v0.3.1 KG. See [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio).
 
 For the local STDIO setup you also need:
 - **Operating System**: macOS, Linux, or Windows
 - **Python 3.10+** and the [uv](https://docs.astral.sh/uv/) package manager
-- **Neo4j Desktop** with the spoke-genelab-v0.3.1 KG imported (installation links are provided in [Option B](#option-b-run-mcp-genelab-locally-with-stdio))
+- **Neo4j Desktop** with the spoke-genelab-v0.3.1 KG imported (installation links are provided in [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio))
 
 ## Quick Start
 
@@ -137,7 +136,7 @@ mcp-genelab can be reached two ways: by connecting to the **remote public endpoi
 
 ### Option A: Connect to the Remote mcp-genelab Server (coming soon)
 
-> **Status: Coming soon.** A public HTTPS endpoint for mcp-genelab is being prepared. When it is live, the URL will be published here and in the [mcp-genelab repository](https://github.com/sbl-sdsc/mcp-genelab). Until then, use [Option B](#option-b-run-mcp-genelab-locally-with-stdio) to run mcp-genelab locally.
+> **Status: Coming soon.** A public HTTPS endpoint for mcp-genelab is being prepared. When it is live, the URL will be published here and in the [mcp-genelab repository](https://github.com/sbl-sdsc/mcp-genelab). Until then, use [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio) to run mcp-genelab locally.
 
 Once the public endpoint is available, you will be able to connect to mcp-genelab without installing anything locally:
 
@@ -177,7 +176,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Then configure your MCP client to launch mcp-genelab over STDIO. For **Claude Desktop**, go to `Claude → Settings → Developer → Edit Config` and  the following mcp-genelab entry:
+Then configure your MCP client to launch mcp-genelab over STDIO. For **Claude Desktop**, go to `Claude → Settings → Developer → Edit Config`d add the following mcp-genelab entry:
 
 ```json
 {
@@ -234,7 +233,7 @@ In the prompt dialog box, click the `+` button:
 2. Toggle MCP services on/off as needed
 ```
 
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/blob/main/docs/images/select_mcp_server.png"
+<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/main/docs/images/select_mcp_server.png"
      alt="tool selector"
      width="600">
 
@@ -479,7 +478,7 @@ This work is supported in part by:
 ### Related Projects
 
 - [Proto-OKN Project](https://www.proto-okn.net/) - Prototype Open Knowledge Network initiative
-- [NSF Open Knowledge Network](https://okn.us/) - 40+ intercnnected knowledge graphs supported by NSF
+- [NSF Open Knowledge Network](https://okn.us/) - 40+ interconnected knowledge graphs supported by NSF
 - [NASA Open Science Data Repository (OSDR)](https://osdr.nasa.gov/bio/repo) - Repository of multi-modal space life science data
 - [NASA GeneLab KG, spoke-genelab](https://github.com/BaranziniLab/spoke_genelab) - Git Repository for creating the spoke-geneLab KG v0.3.1
 - [Model Context Protocol](https://modelcontextprotocol.io/) - AI assistant integration standard
