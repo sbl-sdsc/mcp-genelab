@@ -21,6 +21,8 @@ Helper:
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -66,16 +68,35 @@ def _find_package_dir() -> Path:
                 return candidate
         return None
 
+    # Layout 1/2: package adjacent to the tests dir (flat or src/).
     pkg = _scan(repo_root) or _scan(repo_root / "src")
     if pkg is not None:
         return pkg
 
+    # Layout 3: the tests live in their own subdirectory (mcp-genelab-tests/)
+    # while the package is at the ACTUAL repo root one level up, in src/. This
+    # is the real repository layout. Walk up a couple of levels looking for
+    # <ancestor>/src/<pkg>/server.py or <ancestor>/<pkg>/server.py.
+    for ancestor in (repo_root.parent, repo_root.parent.parent):
+        pkg = _scan(ancestor) or _scan(ancestor / "src")
+        if pkg is not None:
+            return pkg
+
+    # Layout 4 (fallback): the package is pip-installed (e.g. CI does
+    # `pip install -r requirements-test.txt` which pulls in mcp-genelab, or a
+    # developer ran `pip install -e .`). Resolve it via import machinery.
+    try:
+        spec = importlib.util.find_spec("mcp_genelab")
+        if spec and spec.origin:
+            return Path(spec.origin).resolve().parent
+    except Exception:
+        pass
+
     raise RuntimeError(
-        f"Could not locate the package containing server.py under "
-        f"{repo_root} or {repo_root / 'src'}. The test suite expects "
-        f"<repo-root>/<package>/server.py or "
-        f"<repo-root>/src/<package>/server.py, with an __init__.py exposing "
-        f"__version__."
+        f"Could not locate the package containing server.py near {repo_root} "
+        f"(checked flat, src/, and up to two parent levels), nor as an "
+        f"installed 'mcp_genelab' package. Either run the suite from within "
+        f"the repo checkout, or `pip install -e .` the package first."
     )
 
 
@@ -116,6 +137,16 @@ class _FakeRawResult:
         self._records = records
     async def to_eager_result(self) -> _FakeEager:
         return _FakeEager(self._records)
+    def __aiter__(self):
+        # Support `async for record in result` — used by _read_with_count's
+        # streaming/row-capping path in the real server.
+        self._iter = iter(self._records)
+        return self
+    async def __anext__(self) -> _FakeRecord:
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration
 
 
 class _FakeTx:
@@ -126,7 +157,10 @@ class _FakeTx:
         self.route = route
         self.call_log = call_log
 
-    async def run(self, query: str, params: dict[str, Any]) -> _FakeRawResult:
+    async def run(self, query: str, params: dict[str, Any] = None,
+                  timeout: float = None, **kwargs) -> _FakeRawResult:
+        # Accept (and ignore) timeout / any future kwargs the real driver's
+        # tx.run supports, so the server can pass timeout=QUERY_TIMEOUT_SECONDS.
         self.call_log.append((query, params or {}))
         rows = self.route(query, params or {})
         return _FakeRawResult([_FakeRecord(r) for r in rows])
