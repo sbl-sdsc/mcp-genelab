@@ -27,7 +27,62 @@ from neo4j import (
 from pydantic import Field
 
 logger = logging.getLogger("mcp-genelab")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.getenv("MCP_LOG_LEVEL", "INFO").upper())
+
+
+# ===========================================================================
+# Operational / security configuration (env-driven)
+# ===========================================================================
+# These bound the server's resource usage against a public endpoint. All are
+# overridable via environment variables so the same image can be tuned per
+# deployment (AgentCore Runtime, ECS/Fargate, local stdio) without a rebuild.
+#
+# DEPLOYMENT CONTEXT — this server is deployed as a public Streamable HTTP
+# endpoint fronted by CloudFront (AWS WAF: rate-based + managed rules) →
+# API Gateway/Bedrock AgentCore Gateway (CUSTOM_JWT inbound) → Bedrock
+# AgentCore Runtime (OAuth-M2M / SigV4 inbound). On AgentCore Runtime, EACH
+# user session runs in its own isolated Firecracker microVM, so process-level
+# globals (e.g. _USER_OUTPUT_DIR, _LAST_PLOTS) are NOT shared across users.
+# The controls below therefore focus on the two things microVM isolation does
+# NOT solve: (a) bounding any SINGLE query's cost (timeouts, row caps), and
+# (b) protecting the SHARED Neo4j backend that sits behind all microVMs
+# (connection-pool sizing). Per-user request-rate limiting is enforced
+# upstream at the WAF, keyed on identity/IP, not in-process.
+# ===========================================================================
+
+# Maximum wall-clock seconds any single Cypher query may run before it is
+# cancelled. Prevents a pathological or accidental query (e.g. an unbounded
+# variable-length traversal) from holding a Neo4j connection indefinitely.
+QUERY_TIMEOUT_SECONDS: float = float(os.getenv("MCP_QUERY_TIMEOUT_SECONDS", "60"))
+
+# Hard cap on rows returned by the general-purpose `query` tool. The specialist
+# tools already bound their output via top_n; this protects the raw-Cypher
+# fallback from materializing/serializing an enormous result set into one MCP
+# response. Set to 0 to disable (not recommended for public endpoints).
+MAX_QUERY_ROWS: int = int(os.getenv("MCP_MAX_QUERY_ROWS", "1000"))
+
+# Neo4j driver connection-pool sizing. On AgentCore, every microVM has its OWN
+# driver and therefore its OWN pool, and all pools draw on ONE shared Neo4j
+# instance. So the number to reason about is (pool_size x concurrent_sessions)
+# against Neo4j's total connection capacity — kept MODEST.
+NEO4J_POOL_SIZE: int = int(os.getenv("MCP_NEO4J_POOL_SIZE", "20"))
+NEO4J_ACQUISITION_TIMEOUT: float = float(
+    os.getenv("MCP_NEO4J_ACQUISITION_TIMEOUT", "30")
+)
+
+
+def _scrub_for_log(text: str, limit: int = 200) -> str:
+    """Return a log-safe, length-bounded representation of user-supplied text.
+
+    Public-endpoint hygiene: raw Cypher/params and user path strings are logged
+    only in truncated, newline-stripped form to avoid (a) log injection via
+    embedded newlines and (b) unbounded log volume. Full queries are available
+    only at DEBUG level, gated by the operator via MCP_LOG_LEVEL=DEBUG.
+    """
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) > limit:
+        return collapsed[:limit] + f"...(+{len(collapsed) - limit} chars)"
+    return collapsed
 
 
 # ===========================================================================
@@ -78,7 +133,19 @@ _USER_OUTPUT_DIR: Optional[str] = None
 """User-specified path string where output files should be saved. Set by
 set_output_directory. Used as the suggested save location in embedded shell
 commands and (when reachable, i.e. in stdio/local mode) as the actual write
-target for the server's own file output."""
+target for the server's own file output.
+
+⚠️  DEPLOYMENT-SAFETY TRIPWIRE: this is a MODULE-LEVEL GLOBAL. It is safe under
+    AWS Bedrock AgentCore Runtime ONLY because each user session runs in its own
+    isolated Firecracker microVM (separate process, separate memory) — so this
+    global is effectively per-user there. The same is true of the _LAST_PLOTS
+    registry below. If this server is EVER redeployed as a single shared process
+    serving multiple concurrent users (e.g. a plain ECS/Fargate task WITHOUT
+    per-session isolation, or a multi-user local host), this global becomes
+    cross-tenant: User A's set_output_directory would change what User B sees,
+    and User B could fetch_plot User A's filename. In that deployment model,
+    refactor to per-session scoping (e.g. contextvars.ContextVar keyed on the
+    MCP session id) BEFORE launch. See docs/deployment.md §9."""
 
 
 def _get_user_output_dir() -> Optional[str]:
@@ -163,30 +230,71 @@ async def _read(tx: AsyncTransaction, query: str, params: dict[str, Any]) -> str
     Neo4j sessions are not streaming through the MCP boundary anyway — the whole
     result is collected before the tool returns.
     """
-    raw_results = await tx.run(query, params)
+    # timeout= asks Neo4j to cancel the query server-side after N seconds so a
+    # runaway traversal cannot pin a connection indefinitely. See
+    # QUERY_TIMEOUT_SECONDS.
+    raw_results = await tx.run(query, params, timeout=QUERY_TIMEOUT_SECONDS)
     eager_results = await raw_results.to_eager_result()
     return json.dumps([r.data() for r in eager_results.records], default=str)
 
 
-async def _read_with_count(tx: AsyncTransaction, query: str, params: dict[str, Any]) -> tuple[int, str]:
-    """Like _read, but also returns the row count alongside the JSON.
+async def _read_with_count(tx: AsyncTransaction, query: str, params: dict[str, Any]) -> tuple[int, str, bool]:
+    """Like _read, but also returns the row count and a truncation flag.
+
+    Returns (n_rows_returned, json_str, truncated). Rows are streamed and
+    capped at MAX_QUERY_ROWS so the general-purpose `query` tool cannot
+    materialize/serialize an unbounded result set into a single MCP response.
+    When the cap is hit, `truncated` is True and the caller surfaces a notice
+    so the model can add a LIMIT / narrow the query.
 
     Counting from the records list is O(n) on a Python list — much cheaper than
-    re-parsing the serialized JSON string a second time to call len() on it, which
-    is what we'd otherwise have to do for the row-count header.
+    re-parsing the serialized JSON string a second time to call len() on it.
     """
-    raw_results = await tx.run(query, params)
-    eager_results = await raw_results.to_eager_result()
-    records = eager_results.records
-    n = len(records)
-    return n, json.dumps([r.data() for r in records], default=str)
+    raw_results = await tx.run(query, params, timeout=QUERY_TIMEOUT_SECONDS)
+    rows: list[dict] = []
+    truncated = False
+    # Stream rather than to_eager_result() so we can stop at the cap instead of
+    # buffering the entire (possibly huge) result set first.
+    async for record in raw_results:
+        if MAX_QUERY_ROWS and len(rows) >= MAX_QUERY_ROWS:
+            truncated = True
+            break
+        rows.append(record.data())
+    return len(rows), json.dumps(rows, default=str), truncated
+
+
+# Write keywords blocked at the application layer. This is the FIRST of two
+# independent layers; the second is that every session opens with
+# default_access_mode=READ_ACCESS, so Neo4j itself rejects writes at the Bolt
+# protocol level even if this regex were bypassed.
+_WRITE_KEYWORDS_RE = re.compile(
+    r"\b(MERGE|CREATE|SET|DELETE|REMOVE|ADD|DROP)\b", re.IGNORECASE
+)
+
+# Read-only-but-dangerous operations that READ_ACCESS does NOT block because
+# they are not "writes" to the graph: procedures that perform outbound network
+# I/O (SSRF risk), bulk export, or DBMS administration. On a public endpoint
+# these must be denied explicitly. apoc.meta.* / apoc.help are read-only schema
+# introspection used by the schema tools and are intentionally NOT blocked.
+_FORBIDDEN_PROC_RE = re.compile(
+    r"\b(LOAD\s+CSV"
+    r"|CALL\s+apoc\.(load|export|trigger|periodic|refactor|create|merge|cypher|systemdb)\b"
+    r"|CALL\s+dbms\."
+    r"|CALL\s+db\.(create|drop|index\.fulltext\.(create|drop)))",
+    re.IGNORECASE,
+)
+
 
 def _is_write_query(query: str) -> bool:
-    """Check if the query is a write query."""
-    return (
-        re.search(r"\b(MERGE|CREATE|SET|DELETE|REMOVE|ADD|DROP)\b", query, re.IGNORECASE)
-        is not None
-    )
+    """True if the query contains a graph-write keyword (MERGE/CREATE/…)."""
+    return _WRITE_KEYWORDS_RE.search(query) is not None
+
+
+def _is_forbidden_query(query: str) -> bool:
+    """True if the query is a write OR invokes a forbidden procedure
+    (network/export/DBMS). Used by the general-purpose `query` tool to reject
+    unsafe Cypher before it reaches Neo4j on a public endpoint."""
+    return _is_write_query(query) or _FORBIDDEN_PROC_RE.search(query) is not None
 
 
 def _resolve_output_paths(filename_stem: str, extension: str = "csv") -> tuple[str, str, str]:
@@ -770,11 +878,36 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 text="Error: path must be a non-empty string.",
             )]
 
-        # Strip whitespace and normalize trailing separators. Don't expanduser
-        # here — ~ should be expanded by whatever client/script ultimately
-        # writes the file, since the server's home directory is inside the
-        # AgentCore microVM (irrelevant to the user).
+        # Path hygiene. NOTE ON THREAT MODEL: in remote deployment the server
+        # never writes to this path (see _write_csv / plot save, both gated on
+        # `not _is_remote_deployment()`), so this is not a path-traversal sink on
+        # the public endpoint — the string is only echoed back to the same user
+        # and embedded in the save script they run on THEIR machine. Validation
+        # here is (a) defense-in-depth for local stdio mode, where the server
+        # DOES write, and (b) hygiene so a malformed/oversized/newline-laden
+        # value can't corrupt the response or the logs.
         cleaned = path.strip().rstrip('/').rstrip('\\')
+
+        if len(cleaned) > 4096:
+            return [types.TextContent(
+                type="text",
+                text="Error: path is too long (max 4096 characters).",
+            )]
+        if any(ch in cleaned for ch in ("\x00", "\n", "\r")):
+            return [types.TextContent(
+                type="text",
+                text="Error: path must not contain NUL or newline characters.",
+            )]
+        # Reject parent-directory traversal segments regardless of separator
+        # style. Matters for local stdio mode where the path is a real write
+        # target; harmless-but-tidy in remote mode.
+        _norm = cleaned.replace("\\", "/")
+        if any(seg == ".." for seg in _norm.split("/")):
+            return [types.TextContent(
+                type="text",
+                text="Error: path must not contain '..' parent-directory segments.",
+            )]
+
         _set_user_output_dir(cleaned)
 
         deployment_mode = (
@@ -1089,11 +1222,24 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         WRONG: g.gene_name     RIGHT: g.name
         """
 
-        if _is_write_query(query):
+        # Reject writes AND read-only-but-dangerous procedures (network I/O,
+        # export, DBMS admin) before anything reaches Neo4j. READ_ACCESS on the
+        # session is the Bolt-level backstop for graph writes; this catches the
+        # procedure calls READ_ACCESS does not.
+        if _is_forbidden_query(query):
+            logger.warning(
+                "query_rejected", extra={"query": _scrub_for_log(query)}
+            )
             return [types.TextContent(
                 type="text",
-                text="Error: Only read (MATCH) queries are allowed. Write keywords like "
-                     "MERGE, CREATE, SET, DELETE, REMOVE, and ADD are blocked.",
+                text=(
+                    "This query was rejected. Only read-only graph queries are "
+                    "permitted. Write operations (MERGE, CREATE, SET, DELETE, "
+                    "REMOVE, ADD, DROP) and procedures that perform network I/O, "
+                    "bulk export, or database administration (e.g. LOAD CSV, "
+                    "apoc.load.*, apoc.export.*, dbms.*) are not allowed on this "
+                    "endpoint."
+                ),
             )]
 
         # Coerce None → {} to avoid passing a null parameter dict downstream.
@@ -1103,28 +1249,68 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
         try:
             async with neo4j_driver.session(database=database, default_access_mode=READ_ACCESS) as session:
-                total_rows, results_json_str = await session.execute_read(_read_with_count, query, params)
+                total_rows, results_json_str, truncated = await session.execute_read(
+                    _read_with_count, query, params
+                )
 
             logger.debug(f"Read query returned {total_rows} rows ({len(results_json_str)} bytes)")
 
             # Putting `total_rows` at the very top of the response, BEFORE the row
             # data, guarantees the count survives any downstream truncation: even
             # when only a few hundred bytes of preview reach the assistant, the
-            # count is always in those bytes. The count is computed server-side
-            # from the materialized result (one O(n) pass, not a second JSON parse)
-            # so it's always exact.
+            # count is always in those bytes.
             count_header = f"total_rows: {total_rows}\nrows:\n"
+            text = count_header + results_json_str
+            if truncated:
+                text += (
+                    f"\n\n⚠️ Results truncated at {MAX_QUERY_ROWS} rows. Add a "
+                    f"LIMIT / SKIP clause, narrow the pattern, or use a specialist "
+                    f"tool (find_differentially_*, get_study_info) to get complete, "
+                    f"bounded results."
+                )
 
+            return [types.TextContent(type="text", text=text)]
+
+        except asyncio.TimeoutError:
+            logger.warning("query_timeout", extra={"query": _scrub_for_log(query)})
             return [types.TextContent(
                 type="text",
-                text=count_header + results_json_str,
+                text=(
+                    f"The query exceeded the {QUERY_TIMEOUT_SECONDS:.0f}s time "
+                    f"limit and was cancelled. Add a LIMIT, narrow the traversal "
+                    f"depth, or use a specialist tool."
+                ),
             )]
-
         except Exception as e:
-            logger.error(f"Database error executing query: {e}\n{query}\n{params}")
-            return [
-                types.TextContent(type="text", text=f"Error: {e}\n{query}\n{params}")
-            ]
+            # Do NOT echo the raw query, params, or full driver exception back to
+            # the caller on a public endpoint — that can leak internal schema /
+            # deployment detail. Log a scrubbed, bounded record server-side and
+            # return a generic message with just the error type.
+            logger.error(
+                "query_error",
+                extra={
+                    "error_type": type(e).__name__,
+                    "query": _scrub_for_log(query),
+                },
+            )
+            # Neo4j raises a Cypher-timeout as a ClientError, not asyncio.TimeoutError;
+            # detect it by name so the user still gets the actionable hint.
+            if "timeout" in str(e).lower() or "terminated" in str(e).lower():
+                return [types.TextContent(
+                    type="text",
+                    text=(
+                        f"The query exceeded the {QUERY_TIMEOUT_SECONDS:.0f}s time "
+                        f"limit and was cancelled. Add a LIMIT or narrow the query."
+                    ),
+                )]
+            return [types.TextContent(
+                type="text",
+                text=(
+                    f"The query could not be executed ({type(e).__name__}). "
+                    f"Check the Cypher syntax and property names against the "
+                    f"schema (get_neo4j_schema / get_node_metadata)."
+                ),
+            )]
 
     @mcp.tool(
         annotations={
@@ -4934,12 +5120,41 @@ RENDERING REQUIREMENTS:
     return mcp
 
 
+def _require_env(name: str) -> str:
+    """Return a required environment variable or exit. Used for Neo4j
+    credentials in remote deployments so the server never silently starts with
+    an insecure built-in default on a public endpoint."""
+    val = os.getenv(name)
+    if not val:
+        raise SystemExit(
+            f"FATAL: {name} is not set. On a remote/public deployment "
+            f"(MCP_TRANSPORT=streamable-http|http|sse) Neo4j credentials must be "
+            f"injected at runtime (e.g. AWS Secrets Manager via the AgentCore/ECS "
+            f"task definition). Refusing to start with a built-in default."
+        )
+    return val
+
+
 async def async_main() -> None:
-    db_url = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    username = os.getenv("NEO4J_USERNAME", "neo4j")
-    password = os.getenv("NEO4J_PASSWORD", "neo4jdemo")
-    database = os.getenv("NEO4J_DATABASE", "spoke-genelab-v0.3.1")
     transport = os.getenv("MCP_TRANSPORT", "stdio")
+
+    # Credential policy is deployment-aware:
+    #   - Remote (streamable-http/http/sse, i.e. AgentCore Runtime / ECS): NO
+    #     insecure defaults. Every credential MUST be injected at runtime or the
+    #     server refuses to start. This prevents shipping a public endpoint that
+    #     is reachable with a known built-in password.
+    #   - Local stdio: keep the developer-friendly localhost defaults so
+    #     `uvx mcp-genelab` against a local Neo4j still works out of the box.
+    _remote = transport.lower() in ("streamable-http", "http", "sse")
+    if _remote:
+        db_url = _require_env("NEO4J_URI")
+        username = _require_env("NEO4J_USERNAME")
+        password = _require_env("NEO4J_PASSWORD")
+    else:
+        db_url = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        username = os.getenv("NEO4J_USERNAME", "neo4j")
+        password = os.getenv("NEO4J_PASSWORD", "neo4jdemo")
+    database = os.getenv("NEO4J_DATABASE", "spoke-genelab-v0.3.1")
     host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8000"))
     # The server-level `instructions` string is surfaced by most MCP clients
@@ -4981,15 +5196,20 @@ async def async_main() -> None:
     instructions = os.getenv("INSTRUCTIONS", DEFAULT_INSTRUCTIONS)
 
     logger.info(f"Starting mcp-genelab server (transport={transport})")
-    logger.info(f"Neo4j: {db_url}, database: {database}")
+    # Log the host but never the credentials. db_url may embed nothing sensitive
+    # (auth is passed separately) but we still avoid logging username/password.
+    logger.info(f"Neo4j database: {database} (pool_size={NEO4J_POOL_SIZE})")
     logger.info("All Neo4j sessions use READ_ACCESS mode (write operations are blocked)")
 
+    # Bound the connection pool and acquisition timeout. On AgentCore each
+    # microVM has its own pool against the shared Neo4j instance, so keep the
+    # per-process pool modest (see NEO4J_POOL_SIZE). The acquisition timeout
+    # ensures a saturated pool fails fast with a clear error instead of hanging.
     neo4j_driver = AsyncGraphDatabase.driver(
         db_url,
-        auth=(
-            username,
-            password,
-        ),
+        auth=(username, password),
+        max_connection_pool_size=NEO4J_POOL_SIZE,
+        connection_acquisition_timeout=NEO4J_ACQUISITION_TIMEOUT,
     )
 
     mcp = create_mcp_server(neo4j_driver, database, instructions, host=host, port=port)

@@ -10,7 +10,7 @@ authors = [
     { name = "Peter W Rose", email = "pwrose.ucsd@gmail.com" },
 ]
 dependencies = [
-    "mcp>=1.6.0",
+    "mcp>=1.6.0,<2",
     "neo4j>=5.26.0",
     "pydantic>=2.10.1",
     "numpy",
