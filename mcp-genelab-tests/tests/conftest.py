@@ -2,14 +2,14 @@
 server test suite.
 
 The whole suite is offline — no real Neo4j instance, no network calls, no MCP
-transport. We instantiate the FastMCP server in-process, swap in a controllable
+transport. We instantiate the MCPServer (mcp 2.x) in-process, swap in a controllable
 fake driver, and exercise tools via mcp.list_tools() / mcp.call_tool().
 
 Fixtures:
   driver       — module-scoped FakeDriver; tests can override its route
                  function and inspect the Cypher queries that were actually
                  issued via `driver.calls`.
-  mcp_server   — module-scoped FastMCP instance built with the fake driver.
+  mcp_server   — per-test MCPServer instance built with the fake driver.
   tools_list   — module-scoped result of mcp_server.list_tools(); used by
                  the metadata-only tests so we don't pay the construction
                  cost on every test.
@@ -240,6 +240,50 @@ def mcp_server(driver: FakeDriver):
     )
 
 
+@pytest.fixture(autouse=True)
+def local_session():
+    """Isolate per-session state between tests.
+
+    The server keeps NO per-user module globals any more: the output directory
+    and the plot registry live in a SessionState held by
+    `server.SESSION_STORE`, bound per call through a ContextVar. The test
+    suite runs with MCP_TRANSPORT unset (stdio → SESSION_POLICY="implicit"),
+    so tools that are called without a `session_id` resolve to the fixed
+    process-local session (`sessions.LOCAL_SESSION_ID`).
+
+    This fixture (a) wipes the store before every test, (b) binds a fresh
+    local session so tests can seed the registry / output dir out-of-band
+    via `server_module._register_plot(...)`, `_set_user_output_dir(...)`,
+    and (c) unbinds afterwards. Tools invoked through `mcp_server.call_tool`
+    re-resolve to the SAME local SessionState, so seeded state is visible
+    to them and vice versa.
+    """
+    sessions_mod = _SERVER_MODULE._sessions
+    _SERVER_MODULE.SESSION_STORE.clear()
+    state = _SERVER_MODULE.SESSION_STORE.get_or_create_fixed(sessions_mod.LOCAL_SESSION_ID)
+    token = sessions_mod.bind(state)
+    try:
+        yield state
+    finally:
+        sessions_mod.unbind(token)
+        _SERVER_MODULE.SESSION_STORE.clear()
+
+
+@pytest.fixture
+def strict_policy(monkeypatch):
+    """Run a test under the public-endpoint session policy ("strict"): every
+    tool except create_session must be given a valid session_id."""
+    monkeypatch.setattr(_SERVER_MODULE, "SESSION_POLICY", "strict")
+    yield
+
+
+@pytest.fixture
+def strict_mcp_server(strict_policy, driver: FakeDriver):
+    """A server BUILT under the strict policy, so `session_id` is a required
+    property in every tool schema (except create_session)."""
+    return _SERVER_MODULE.create_mcp_server(driver, database="testdb", instructions="")
+
+
 @pytest.fixture
 def tools_list(mcp_server) -> list:
     """The list of registered Tool objects as an MCP client would see them
@@ -249,11 +293,20 @@ def tools_list(mcp_server) -> list:
 
 # --- Helpers ---------------------------------------------------------------
 
+def _content_of(result):
+    """Return the list of content blocks from whatever `MCPServer.call_tool`
+    returned: a `CallToolResult` (mcp 2.x), a `(content, structured)` tuple
+    (mcp 1.x with structured output) or a bare content list (legacy)."""
+    content = getattr(result, "content", result)
+    if isinstance(content, tuple) and len(content) == 2 and isinstance(content[0], (list, tuple)):
+        content = content[0]
+    return content
+
+
 def text_from(result) -> str:
     """Flatten an MCP tool-call result into a single text string for
-    substring assertions. Handles both the modern (content, structured) tuple
-    return and the legacy plain-list return."""
-    content = result[0] if isinstance(result, tuple) else result
+    substring assertions."""
+    content = _content_of(result)
     parts = []
     for c in content:
         if hasattr(c, "text") and c.text is not None:

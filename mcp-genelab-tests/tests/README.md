@@ -12,14 +12,15 @@ should tell you immediately what regressed.
 
 | File | What it guards |
 |---|---|
-| `test_tools_list.py` | All 22 tools register; every tool has title + readOnlyHint + idempotentHint + openWorldHint; titles are unique; the right tools are read-only vs. file-writing. |
+| `test_tools_list.py` | All 24 tools register (22 + `create_session`/`end_session`); every tool has title + readOnlyHint + idempotentHint + openWorldHint; titles are unique; the right tools are read-only vs. file-writing. |
 | `test_query_routing.py` | The `query` tool's docstring leads with FALLBACK, uses arrow notation, names every specialist, includes a DO NOT clause, and explains the CSV side-channel. The server-level `DEFAULT_INSTRUCTIONS` block exists and uses imperative ALWAYS/NEVER language. |
 | `test_specialist_docstrings.py` | All 9 specialist tools (3 single-assay, 2 metadata, 4 cross-assay) lead with `USE THIS TOOL (not the \`query\` tool)`. |
 | `test_top_n_widening.py` | `top_n` on the three single-assay tools (DEG/DMR/abundance) has `Optional[int]` JSON Schema (accepts null), default 10, and the description explains the `None = all rows` contract. |
 | `test_data_tools.py` | End-to-end functional tests of `get_study_info`, `find_differentially_expressed_genes`, `find_differentially_methylated_regions`, `find_differentially_abundant_organisms`, `query`, and `select_assays` against a stub driver. |
 | `test_common_tools.py` | End-to-end functional tests of the four cross-assay specialist tools, including correct intersection semantics (genes in BOTH assays kept; genes in only one filtered out). |
 | `test_cypher_invariants.py` | Defensive checks on the Cypher actually issued: write-blocking is case-insensitive and covers every write verb; lnfc clause is null-safe; LIMIT clause is conditionally present; MR filter parameters reach the Cypher; pooled methylation uses `IN $assay_ids`. |
-| `test_plot_outputs.py` | Plot delivery via MCP resources: the `plot://{filename}` resource template registers and round-trips, `fetch_plot` returns the registered PNG bytes (and errors helpfully for unknown names), save instructions stay compact and reference the resource URI, and volcano/Venn render at the same conservative dpi. |
+| `test_session_isolation.py` | Per-session isolation for the shared-process deployment: `create_session`/`end_session`, cross-session invisibility of output dir + plots (tools and `plot://` resource), strict-policy errors (missing/unknown/malformed/expired → call `create_session`), TTL/LRU/byte bounds, `/healthz` + `/readyz` routes, usage metrics. |
+| `test_plot_outputs.py` | Plot delivery via MCP resources: the session-scoped `plot://{session_id}/{filename}` resource template registers and round-trips, `fetch_plot` returns the registered PNG bytes (and errors helpfully for unknown names), save instructions stay compact and reference the resource URI, and volcano/Venn render at the same conservative dpi. |
 | `test_uncovered_tools.py` | End-to-end functional invocation of the 11 tools the other files only checked for registration: `get_neo4j_schema`, `get_node_metadata`, `get_relationship_metadata`, `set_output_directory`, `get_output_directory`, `create_volcano_plot`, `create_venn_diagram`, `get_save_script`, `clean_mermaid_diagram`, `create_chat_transcript`, and `visualize_schema`. |
 
 > **Tool coverage:** together with the specialists in `test_data_tools.py` / `test_common_tools.py` and `fetch_plot` in `test_plot_outputs.py`, every one of the 22 registered tools is now invoked through `mcp_server.call_tool(...)` by at least one test — registration alone is no longer the only thing checked for any tool.
@@ -60,7 +61,7 @@ should use:
 - `driver` — a fresh `FakeDriver` per test. Set its `route` function to a
   callable mapping `(query_str, params_dict) -> list[dict]`. Every Cypher
   invocation is recorded in `driver.calls`.
-- `mcp_server` — a FastMCP server wired to the per-test `driver`.
+- `mcp_server` — an `MCPServer` (mcp 2.x) wired to the per-test `driver`.
 - `tools_list` — the result of `mcp_server.list_tools()`, materialized
   synchronously. Use for any test that inspects tool metadata without
   invoking a tool.

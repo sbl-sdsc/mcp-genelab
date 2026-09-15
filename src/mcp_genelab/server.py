@@ -4,6 +4,7 @@ import logging
 import re
 import base64
 import asyncio
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -17,7 +18,8 @@ from matplotlib_venn import venn2, venn3
 from adjustText import adjust_text
 
 import mcp.types as types
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer, Context
+from mcp.server.mcpserver.exceptions import ResourceError
 from neo4j import (
     AsyncDriver,
     AsyncGraphDatabase,
@@ -25,6 +27,10 @@ from neo4j import (
     READ_ACCESS
 )
 from pydantic import Field
+
+from . import sessions as _sessions
+from . import metrics as _metrics
+from .sessions import SessionError, SessionState
 
 logger = logging.getLogger("mcp-genelab")
 logger.setLevel(os.getenv("MCP_LOG_LEVEL", "INFO").upper())
@@ -35,19 +41,28 @@ logger.setLevel(os.getenv("MCP_LOG_LEVEL", "INFO").upper())
 # ===========================================================================
 # These bound the server's resource usage against a public endpoint. All are
 # overridable via environment variables so the same image can be tuned per
-# deployment (AgentCore Runtime, ECS/Fargate, local stdio) without a rebuild.
+# deployment (ECS/Fargate, local stdio) without a rebuild.
 #
 # DEPLOYMENT CONTEXT — this server is deployed as a public Streamable HTTP
-# endpoint fronted by CloudFront (AWS WAF: rate-based + managed rules) →
-# API Gateway/Bedrock AgentCore Gateway (CUSTOM_JWT inbound) → Bedrock
-# AgentCore Runtime (OAuth-M2M / SigV4 inbound). On AgentCore Runtime, EACH
-# user session runs in its own isolated Firecracker microVM, so process-level
-# globals (e.g. _USER_OUTPUT_DIR, _LAST_PLOTS) are NOT shared across users.
-# The controls below therefore focus on the two things microVM isolation does
-# NOT solve: (a) bounding any SINGLE query's cost (timeouts, row caps), and
-# (b) protecting the SHARED Neo4j backend that sits behind all microVMs
-# (connection-pool sizing). Per-user request-rate limiting is enforced
-# upstream at the WAF, keyed on identity/IP, not in-process.
+# endpoint: MCP client → CloudFront (AWS WAF: rate-based + managed rules) →
+# ALB → ECS Fargate task (THIS process, shared by ALL users) → Neo4j on EC2.
+#
+# There is NO per-user process isolation in that topology. One long-lived
+# process serves every user, and the ALB may spread one user's requests over
+# several tasks. Two consequences shape this file:
+#
+#   (a) Per-user state (output directory, plot registry) is keyed on an
+#       application-level SESSION ID that the agent obtains from the
+#       `create_session` tool and passes on every call. It is bound per
+#       request via a ContextVar (see mcp_genelab.sessions). Module globals
+#       hold NO per-user state.
+#   (b) Query-cost controls (timeouts, row caps) and Neo4j pool sizing protect
+#       the SHARED Neo4j backend; the number to reason about is
+#       pool_size × number_of_tasks. Per-client request-rate limiting is
+#       enforced upstream at the WAF (keyed on IP), not in-process.
+#
+# Usage metrics are produced in-process (see mcp_genelab.metrics) because no
+# platform layer observes tool calls behind an ALB.
 # ===========================================================================
 
 # Maximum wall-clock seconds any single Cypher query may run before it is
@@ -61,11 +76,32 @@ QUERY_TIMEOUT_SECONDS: float = float(os.getenv("MCP_QUERY_TIMEOUT_SECONDS", "60"
 # response. Set to 0 to disable (not recommended for public endpoints).
 MAX_QUERY_ROWS: int = int(os.getenv("MCP_MAX_QUERY_ROWS", "1000"))
 
-# Neo4j driver connection-pool sizing. On AgentCore, every microVM has its OWN
-# driver and therefore its OWN pool, and all pools draw on ONE shared Neo4j
-# instance. So the number to reason about is (pool_size x concurrent_sessions)
-# against Neo4j's total connection capacity — kept MODEST.
+# Neo4j driver connection-pool sizing. Each ECS task runs ONE process with ONE
+# driver and therefore ONE pool shared by every session on that task; all
+# tasks draw on ONE shared Neo4j instance. So the number to reason about is
+# (pool_size x number_of_tasks) against Neo4j's total connection capacity —
+# keep the per-task pool MODEST (10–20).
 NEO4J_POOL_SIZE: int = int(os.getenv("MCP_NEO4J_POOL_SIZE", "20"))
+
+# Readiness-probe budget for `GET /readyz` (a `RETURN 1` round-trip). Keep it
+# under the ALB health-check timeout (default 5 s) so a slow Neo4j surfaces
+# as 503 rather than as an ALB-side timeout.
+READYZ_TIMEOUT_SECONDS: float = float(os.getenv("MCP_READYZ_TIMEOUT_SECONDS", "4"))
+
+# Reuse the last /readyz verdict for this long so probe bursts cannot amplify
+# into Neo4j load (0 disables the cache).
+READYZ_CACHE_SECONDS: float = float(os.getenv("MCP_READYZ_CACHE_SECONDS", "2"))
+
+# Streamable-HTTP transport options for the public endpoint (mcp 2.x passes
+# these to run_streamable_http_async / streamable_http_app, not the server
+# constructor). Kept in one place so the test harness builds the SAME app the
+# container runs. `max_request_body_size` is a second body-size cap behind the
+# WAF's; a Cypher string does not need more than this.
+STREAMABLE_HTTP_OPTIONS: dict[str, Any] = {
+    "stateless_http": True,
+    "json_response": False,  # SSE-framed responses: the widest client compatibility
+    "max_request_body_size": int(os.getenv("MCP_MAX_REQUEST_BODY_BYTES", str(1024 * 1024))),
+}
 NEO4J_ACQUISITION_TIMEOUT: float = float(
     os.getenv("MCP_NEO4J_ACQUISITION_TIMEOUT", "30")
 )
@@ -86,138 +122,280 @@ def _scrub_for_log(text: str, limit: int = 200) -> str:
 
 
 # ===========================================================================
-# Output-directory configuration
+# Per-session state (output directory + plot registry)
 # ===========================================================================
-# The MCP server may run in three different deployment contexts:
+# The MCP server may run in two deployment contexts:
 #
-#   1. AWS Bedrock AgentCore Runtime — server is in an ephemeral Firecracker
-#      microVM, container filesystem is NOT reachable by the user. Any file the
-#      server writes lives only inside the microVM until session end. There is
-#      no network mount, no bind mount, no way for the server to push bytes to
-#      the user's local disk directly.
+#   1. Remote (ECS Fargate behind ALB, streamable-http) — ONE process serves
+#      MANY users concurrently and the container filesystem is NOT reachable
+#      by any of them. Files reach the user only as inline content
+#      (ImageContent / fenced CSV) or via the plot:// resource / fetch_plot.
 #
-#   2. Claude.ai chat UI — server runs on the user's machine via stdio, and
-#      Claude's analysis runtime separately mounts /mnt/user-data/outputs/
-#      which the LLM's bash_tool can read. Files written there become
-#      downloadable via Claude's present_files tool.
+#   2. Local stdio — the server is a child process on the user's own machine
+#      serving exactly one user; ~/Downloads (or the path they set) is a real
+#      write target.
 #
-#   3. Local stdio — server is a child process on the user's own machine.
-#      ~/Downloads works because the path resolves to the user's filesystem.
+# In context (1) every piece of per-user state MUST be keyed on a session:
 #
-# In context (1), the user CANNOT receive files by having the server write to
-# its own disk — that disk is unreachable. The only mechanisms that work are:
-#   (a) Inline content: ImageContent (PNG) and TextContent (markdown/CSV) come
-#       back in the JSON-RPC response, are passed through by AgentCore unchanged,
-#       and are rendered by the user's MCP client.
-#   (b) Embedded shell commands: a TextContent block carries the base64 image
-#       bytes and a copy-paste-ready `python3 -c "..."` command the user (or
-#       their LLM-with-bash) can run on their own machine to materialize the
-#       file at any path they want.
+#   - The agent calls `create_session` once → receives an opaque session_id.
+#   - Every subsequent tool call passes `session_id`. `_resolve_session()`
+#     validates it (unknown/expired → actionable error asking for a new
+#     session) and binds the SessionState to a ContextVar for the duration of
+#     the call. Helpers further down the stack (`_get_user_output_dir`,
+#     `_register_plot`, `_lookup_plot`, …) read that ContextVar, so they need
+#     no extra parameters and there is NO module-level per-user state.
+#   - Plot resources are addressed as plot://{session_id}/{filename}, so a
+#     `resources/read` from one session can never resolve another's plot.
 #
-# To let the user specify a save path on their own machine, the new
-# `set_output_directory` tool stores a path string in this module-level dict
-# keyed by what we have available for session identity. In AgentCore stateless
-# mode, FastMCP passes through the Mcp-Session-Id header but we cannot reliably
-# read it from inside a tool. So we use a single module-level variable: each
-# microVM serves exactly one user session, so a single global is correct for
-# AgentCore. For multiplexed deployments (uncommon), users would each call
-# `set_output_directory` at the start of their session.
+# In context (2) the same code path runs with an implicit, process-local
+# session (`sessions.LOCAL_SESSION_ID`) so local users need not create one.
 #
-# The stored path is used in two ways:
-#   - In stdio / local deployments, the server writes the file there directly.
-#   - In all deployments, the path is used as the suggested save location in
-#     the embedded shell command emitted with every plot.
+# Why an application-level id instead of the transport's Mcp-Session-Id:
+#   * stateless_http=True (our mode) ISSUES no Mcp-Session-Id, and does not
+#     validate one either — a client-supplied header passes straight through
+#     to request.headers. It is therefore attacker-chosen and MUST NOT be
+#     used as an identity (two clients sending the same value would share
+#     state). It is deliberately ignored.
+#   * stateful mode would bind each session to the ONE task that created it,
+#     and ALB stickiness is cookie-only (cannot key on a header), so requests
+#     spread across tasks would fail;
+#   * an explicit parameter works identically for every client (ChatGPT,
+#     Claude, Cursor, curl). Only ids minted by create_session (unguessable,
+#     validated) are accepted.
 # ===========================================================================
 
-_USER_OUTPUT_DIR: Optional[str] = None
-"""User-specified path string where output files should be saved. Set by
-set_output_directory. Used as the suggested save location in embedded shell
-commands and (when reachable, i.e. in stdio/local mode) as the actual write
-target for the server's own file output.
+SESSION_STORE = _sessions.SessionStore()
+"""Process-wide registry of live sessions (bounded, TTL-evicting). Per-user
+state lives INSIDE the SessionState objects it holds — never in this module."""
 
-⚠️  DEPLOYMENT-SAFETY TRIPWIRE: this is a MODULE-LEVEL GLOBAL. It is safe under
-    AWS Bedrock AgentCore Runtime ONLY because each user session runs in its own
-    isolated Firecracker microVM (separate process, separate memory) — so this
-    global is effectively per-user there. The same is true of the _LAST_PLOTS
-    registry below. If this server is EVER redeployed as a single shared process
-    serving multiple concurrent users (e.g. a plain ECS/Fargate task WITHOUT
-    per-session isolation, or a multi-user local host), this global becomes
-    cross-tenant: User A's set_output_directory would change what User B sees,
-    and User B could fetch_plot User A's filename. In that deployment model,
-    refactor to per-session scoping (e.g. contextvars.ContextVar keyed on the
-    MCP session id) BEFORE launch. See docs/deployment.md §9."""
+MAX_LAST_PLOTS = _sessions.MAX_PLOTS_PER_SESSION
+"""Plots retained per session (FIFO eviction). Kept as a module name for
+backwards compatibility with docs/tests; the value is MCP_MAX_PLOTS_PER_SESSION."""
+
+# How tool calls obtain their session:
+#   "strict"   — every tool except create_session REQUIRES a valid session_id
+#                (default for remote transports — the shared-process case).
+#   "lenient"  — session_id is optional; tools that only read the KG work
+#                without one, tools that need per-user state still require it.
+#   "implicit" — no session_id needed; a fixed process-local session is used
+#                (default for local stdio — one user, one process).
+# Read at call time (not import time) so tests can flip it.
+SESSION_POLICY: str = os.getenv(
+    "MCP_SESSION_POLICY",
+    "strict" if os.getenv("MCP_TRANSPORT", "stdio").lower() in ("streamable-http", "http", "sse") else "implicit",
+).lower()
+
+# Tools that read or write per-user state. In "lenient" mode these still
+# require a session; everything else may run anonymously.
+_STATEFUL_TOOLS = frozenset({
+    "set_output_directory", "get_output_directory", "get_save_script",
+    "fetch_plot", "end_session",
+})
+
+_SESSION_ID_FIELD_DESCRIPTION = (
+    "Session id returned by `create_session()`. This server serves many users "
+    "from one process; the session id is what keeps your output directory and "
+    "generated plots private to you. Pass the SAME value on every tool call. "
+    "If the server replies that the session is unknown or expired, call "
+    "`create_session()` again and use the new id."
+)
+
+
+def _session_id_field(required: Optional[bool] = None):
+    """Pydantic Field for the `session_id` tool parameter.
+
+    Under the `strict` policy (the public endpoint) the parameter is marked
+    REQUIRED in the tool schema so LLM clients supply it proactively instead
+    of learning by error; under `lenient`/`implicit` it is optional. Evaluated
+    when the server is built (create_mcp_server), not at import."""
+    if required is None:
+        required = SESSION_POLICY == "strict"
+    if required:
+        return Field(..., description=_SESSION_ID_FIELD_DESCRIPTION)
+    return Field(None, description=_SESSION_ID_FIELD_DESCRIPTION)
+
+
+def _request_headers(ctx: Optional[Context]) -> "dict[str, str]":
+    """Lower-cased request headers from the injected Context, or {} in stdio
+    mode / outside a request. In mcp 2.x headers are reached through
+    `ctx.headers`; there is no process-global request context."""
+    try:
+        if ctx is None:
+            return {}
+        headers = ctx.headers
+        if not headers:
+            return {}
+        return {str(k).lower(): str(v) for k, v in headers.items()}
+    except Exception:  # Context outside a request raises ValueError
+        return {}
+
+
+def _client_label(ctx: Optional[Context] = None) -> str:
+    """Best-effort, non-identifying client label for usage metrics
+    (User-Agent, truncated). Empty in stdio mode or outside a request."""
+    return (_request_headers(ctx).get("user-agent") or "")[:120]
+
+
+def _client_ip(headers: "dict[str, str]") -> str:
+    """Viewer IP as seen at the edge. Behind CloudFront → ALB the first hop of
+    X-Forwarded-For is the viewer (CloudFront appends itself after it, the
+    ALB appends CloudFront); CloudFront-Viewer-Address is the same value with
+    a port. Empty when neither header is present (direct/local access)."""
+    xff = headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    cva = headers.get("cloudfront-viewer-address", "")
+    if cva:
+        return cva.rsplit(":", 1)[0].strip()
+    return ""
+
+
+def _client_fingerprint(ctx: Optional[Context] = None) -> str:
+    """Stable, non-reversible label for "the same client" across sessions:
+    salted SHA-256 of viewer IP + User-Agent, 16 hex chars.
+
+    Why: the no-auth route has no identity, so this is the only way to
+    answer "how many distinct conversations came from the same user/client"
+    (Logs Insights: `filter event="session_created" | stats count() by
+    client_fp`). It is a heuristic — users behind one NAT with the same
+    client share a fingerprint; one user on two clients gets two — and it is
+    deliberately NOT an identity or an auth signal.
+
+    Privacy: the raw IP is never logged. The salt (`MCP_USAGE_FP_SALT`)
+    makes the hash unguessable; set it from Secrets Manager so fingerprints
+    stay comparable across task restarts (without it a random per-process
+    salt is used and fingerprints are only comparable within one task's
+    lifetime). Empty in stdio mode / when no headers are available."""
+    headers = _request_headers(ctx)
+    if not headers:
+        return ""
+    ip = _client_ip(headers)
+    ua = headers.get("user-agent", "")
+    if not ip and not ua:
+        return ""
+    return _metrics.fingerprint(f"{ip}|{ua}")
+
+
+def _resolve_session(session_id: Optional[str], tool_name: str = "") -> Optional[SessionState]:
+    """Resolve the session for the current tool call and BIND it to the
+    request context (ContextVar). Returns the SessionState, or None when the
+    call may proceed anonymously (lenient policy, stateless tool).
+
+    Raises SessionError with an agent-actionable message when a session is
+    required but missing/unknown/expired. Tool bodies convert that into a
+    TextContent error via `_session_error_content`.
+
+    Resolution order:
+      1. explicit `session_id` argument (the contract on the public endpoint);
+      2. policy fallback: implicit local session (stdio) / anonymous (lenient)
+         / error (strict).
+    The transport's `Mcp-Session-Id` header is deliberately NOT consulted: in
+    stateless mode it is client-supplied and unvalidated (see the section
+    comment above).
+    """
+    policy = SESSION_POLICY
+    sid = (session_id or "").strip() or None
+
+    if sid is None:
+        if policy == "implicit":
+            state = SESSION_STORE.get_or_create_fixed(_sessions.LOCAL_SESSION_ID)
+            _sessions.bind(state)
+            return state
+        if policy == "lenient" and tool_name not in _STATEFUL_TOOLS:
+            _sessions.bind(None)
+            return None
+        _metrics.REGISTRY.record_session_rejected("missing", tool_name)
+        raise SessionError("missing", _sessions._session_not_found_message("missing"))
+
+    # Explicit id: `local` is only meaningful in implicit mode.
+    if sid == _sessions.LOCAL_SESSION_ID and policy == "implicit":
+        state = SESSION_STORE.get_or_create_fixed(sid)
+        _sessions.bind(state)
+        return state
+
+    try:
+        state = SESSION_STORE.get(sid)
+    except SessionError as e:
+        _metrics.REGISTRY.record_session_rejected(e.reason, tool_name)
+        raise
+    _sessions.bind(state)
+    return state
+
+
+def _session_error_content(e: SessionError) -> list[types.TextContent]:
+    return [types.TextContent(type="text", text=f"Error ({e.reason} session): {e}")]
+
+
+def _current_session_id() -> Optional[str]:
+    s = _sessions.current()
+    return s.session_id if s is not None else None
 
 
 def _get_user_output_dir() -> Optional[str]:
-    """Return the user-specified output directory if set, else None."""
-    return _USER_OUTPUT_DIR
+    """Return the CURRENT SESSION's output directory, or None if unset / no
+    session is bound."""
+    s = _sessions.current()
+    return s.output_dir if s is not None else None
 
 
-def _set_user_output_dir(path: str) -> None:
-    """Set the user-specified output directory. Caller is responsible for
-    validation; this just stores the string."""
-    global _USER_OUTPUT_DIR
-    _USER_OUTPUT_DIR = path
+def _set_user_output_dir(path: Optional[str]) -> None:
+    """Set the CURRENT SESSION's output directory. Caller validates. A no-op
+    when no session is bound (anonymous lenient call) — callers gate on
+    `_STATEFUL_TOOLS` so that cannot happen for set_output_directory."""
+    s = _sessions.current()
+    if s is not None:
+        s.output_dir = path
 
 
 # ---------------------------------------------------------------------------
-# Last-plot registry
+# Plot registry (per session)
 # ---------------------------------------------------------------------------
-# Stores the PNG bytes and user-facing path of the most recently generated
-# plot, keyed by the suggested filename. Used by `get_save_script` so the
-# user can request a copy-paste-ready Python save script ON DEMAND, rather
-# than having every plot response carry one inline (which doubles the
-# response size and burns conversation context).
-#
-# The registry is bounded to MAX_LAST_PLOTS entries (FIFO eviction) so
-# memory stays predictable in long sessions. PNG bytes for evicted entries
-# are dropped — if the user asks for a save script for an old plot they'll
-# need to regenerate it. In AgentCore Runtime each session is its own
-# microVM, so the bound is more of a hygiene measure than a hard need.
+# Stores the PNG bytes and user-facing path of recently generated plots for
+# the CURRENT SESSION, keyed by suggested filename. Used by `get_save_script`,
+# `fetch_plot` and the plot://{session_id}/{filename} resource so the bytes
+# can be re-fetched without re-running Cypher + matplotlib. Bounded per
+# session (MAX_LAST_PLOTS, FIFO) and process-wide (MCP_MAX_TOTAL_PLOT_BYTES).
 # ---------------------------------------------------------------------------
 
-_LAST_PLOTS: "dict[str, tuple[bytes, str]]" = {}
-"""Map of suggested_filename → (png_bytes, user_facing_path) for recently
-generated plots, available for on-demand save-script retrieval via
-the `get_save_script` tool."""
-
-MAX_LAST_PLOTS = 8
-"""Maximum number of plots to retain bytes for. Older entries are evicted
-FIFO. Tuned to cover a typical analysis session (a few volcano plots +
-a few Venn diagrams) without bloating memory."""
-
-
-def _register_plot(suggested_filename: str, png_bytes: bytes, user_facing_path: str) -> None:
-    """Record a freshly-generated plot's bytes so a save script can be
-    produced on demand later. FIFO-evicts to keep MAX_LAST_PLOTS entries."""
-    # If already registered (re-generation of the same plot), update in place
-    # rather than evicting; this also preserves insertion order.
-    _LAST_PLOTS[suggested_filename] = (png_bytes, user_facing_path)
-    while len(_LAST_PLOTS) > MAX_LAST_PLOTS:
-        # Pop the oldest entry. In Python 3.7+ dicts preserve insertion order.
-        oldest = next(iter(_LAST_PLOTS))
-        del _LAST_PLOTS[oldest]
+def _register_plot(suggested_filename: str, png_bytes: bytes, user_facing_path: str) -> bool:
+    """Record a freshly-generated plot in the current session's registry.
+    Returns False (and registers nothing) when no session is bound."""
+    s = _sessions.current()
+    if s is None:
+        return False
+    s.register_plot(suggested_filename, png_bytes, user_facing_path)
+    SESSION_STORE.after_mutation()
+    _metrics.REGISTRY.record_plot_registered()
+    return True
 
 
 def _lookup_plot(suggested_filename: str) -> "Optional[tuple[bytes, str]]":
-    """Return (png_bytes, user_facing_path) for a previously-registered plot,
-    or None if the filename isn't in the registry (e.g. it was evicted, or it
-    came from a different session)."""
-    return _LAST_PLOTS.get(suggested_filename)
+    """Return (png_bytes, user_facing_path) for a plot in the current
+    session's registry, or None (evicted, never registered, or it belongs to
+    a different session — the registry is per session by construction)."""
+    s = _sessions.current()
+    return s.lookup_plot(suggested_filename) if s is not None else None
 
 
 def _list_registered_plots() -> "list[str]":
-    """Return the suggested filenames currently in the registry, oldest first."""
-    return list(_LAST_PLOTS.keys())
+    """Suggested filenames in the current session's registry, oldest first."""
+    s = _sessions.current()
+    return s.list_plots() if s is not None else []
+
+
+def _plot_uri(filename: str) -> str:
+    """Canonical resource URI for a plot in the current session."""
+    sid = _current_session_id() or _sessions.LOCAL_SESSION_ID
+    return f"plot://{sid}/{filename}"
 
 
 def _is_remote_deployment() -> bool:
     """True when this server is running in a transport mode where the
-    container's filesystem is not reachable by the user (e.g. AgentCore
-    Runtime, any streamable-http deployment). False in local stdio mode.
+    container's filesystem is not reachable by the user (ECS Fargate / any
+    streamable-http deployment). False in local stdio mode.
 
     In remote deployment, server-side file writes don't deliver files to the
-    user — only inline content + embedded shell commands do."""
+    user — only inline content, the plot:// resource and fetch_plot do."""
     transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
     return transport in ("streamable-http", "http", "sse")
 
@@ -339,7 +517,7 @@ def _resolve_output_paths(filename_stem: str, extension: str = "csv") -> tuple[s
         user_facing = os.path.join(user_dir, filename)
         if _is_remote_deployment():
             # Server cannot reach user_dir, so write a working copy to a
-            # location we KNOW is writable (the microVM's /tmp). The
+            # location we KNOW is writable (the container's /tmp). The
             # working copy is only used to support inline base64 encoding;
             # the user's actual file comes from the embedded save command.
             write_path = os.path.join('/tmp', filename)
@@ -355,11 +533,11 @@ def _resolve_output_paths(filename_stem: str, extension: str = "csv") -> tuple[s
 
     if _is_remote_deployment():
         # No user dir set AND in remote deployment. Write the server's working
-        # copy to /tmp (somewhere we know is writable inside the microVM), but
+        # copy to /tmp (somewhere we know is writable inside the container), but
         # surface a USER-FACING path of ./<filename> — that's where the user's
         # save script will land the file when they run it on their own machine
         # (which they presumably do from a directory of their choice). This is
-        # friendlier than dumping the AgentCore microVM's /tmp path on them.
+        # friendlier than dumping the container's /tmp path on them.
         path = os.path.join('/tmp', filename)
         user_facing = f"./{filename}"
         return path, user_facing, (
@@ -421,8 +599,8 @@ def _write_results_csv(rows: list[dict], filename_stem: str) -> tuple[Optional[s
       - Local stdio mode (`_is_remote_deployment()` is False): the server writes
         the CSV to disk at the resolved path so users on their own machine can
         open the file directly.
-      - Remote mode (AgentCore Runtime / streamable-http): the server SKIPS the
-        disk write — the microVM filesystem isn't reachable by the user, so a
+      - Remote mode (ECS Fargate / streamable-http): the server SKIPS the
+        disk write — the container filesystem isn't reachable by the user, so a
         file in `/tmp` is just leaked I/O. The CSV reaches the user via the
         inline fenced `csv` code block in the response (rendered by every MCP
         client). We still return a suggested user-facing path string and a
@@ -440,7 +618,7 @@ def _write_results_csv(rows: list[dict], filename_stem: str) -> tuple[Optional[s
             filename_stem, extension="csv"
         )
         # In remote mode the inline CSV is the user's only reachable copy.
-        # Writing to /tmp inside the microVM accomplishes nothing except
+        # Writing to /tmp inside the container accomplishes nothing except
         # consuming temp space, which can leak across stateful sessions.
         # We still need to return the user_facing_path / download_link so the
         # response can present a meaningful suggested filename.
@@ -487,8 +665,8 @@ def _canonical_block(
         Cursor, etc.).
 
     Why inline CSV text and not a `_CSV: /path/...` reference:
-      In remote deployments (AgentCore Runtime), the server runs in an
-      ephemeral microVM whose filesystem is not reachable by the user. A
+      In remote deployments (ECS Fargate), the server runs in a container
+      whose filesystem is not reachable by the user. A
       `_CSV: /tmp/foo.csv` line would point to a path the user can't open.
       Inline CSV text is plain markdown and is delivered to every MCP
       client, ephemeral container or not.
@@ -516,16 +694,18 @@ def _make_save_instructions(
     user_facing_path: str,
     suggested_filename: str,
     png_size_bytes: int,
+    session_id: Optional[str] = None,
 ) -> str:
     """Build a markdown block listing the available retrieval paths for
     the PNG bytes of a previously generated plot.
 
-    The response references the canonical resource URI (plot://<filename>)
-    and the fetch_plot tool. Both retrieve the bytes from the in-memory
-    plot registry via a separate request, independent of this tool's
-    response. The registry holds the last MAX_LAST_PLOTS plots
-    (FIFO eviction), so resource URIs remain stable across calls within
-    a session and a failed fetch can be retried without re-rendering.
+    The response references the canonical resource URI
+    (plot://<session_id>/<filename>) and the fetch_plot tool. Both retrieve
+    the bytes from the per-session plot registry via a separate request,
+    independent of this tool's response. The registry holds the last
+    MAX_LAST_PLOTS plots of the session (FIFO eviction), so resource URIs
+    remain stable across calls within a session and a failed fetch can be
+    retried without re-rendering.
 
     Args:
         user_facing_path: where the user has asked files to be saved.
@@ -535,7 +715,11 @@ def _make_save_instructions(
             construct the plot:// URI and the fetch_plot call.
         png_size_bytes: size of the PNG in bytes, shown to the user so
             they know what to expect.
+        session_id: the session that owns the plot. Defaults to the
+            session bound to the current call.
     """
+    sid = session_id or _current_session_id() or _sessions.LOCAL_SESSION_ID
+    uri = f"plot://{sid}/{suggested_filename}"
     size_kb = max(1, png_size_bytes // 1024)
     return (
         f"\n---\n"
@@ -551,31 +735,32 @@ def _make_save_instructions(
         f"Cursor, Claude Code, the filesystem MCP server), ask it to save the "
         f"inline PNG to `{user_facing_path}`. If the inline image is missing "
         f"or didn't render cleanly, the LLM can re-fetch the canonical bytes "
-        f"without re-rendering by calling `fetch_plot(filename=\"{suggested_filename}\")` "
-        f"or reading the resource at `plot://{suggested_filename}`.\n\n"
+        f"without re-rendering by calling "
+        f"`fetch_plot(session_id=\"{sid}\", filename=\"{suggested_filename}\")` "
+        f"or reading the resource at `{uri}`.\n\n"
         f"**Option C — Re-fetch via resource URI.** Clients that support MCP "
         f"resources can fetch the canonical PNG bytes via "
-        f"`resources/read` on `plot://{suggested_filename}`. This is the most "
+        f"`resources/read` on `{uri}`. This is the most "
         f"robust path because the fetch is a separate request that can be "
         f"retried if the original response was corrupted in transit.\n"
     )
-
 
 
 def _make_save_hint(
     user_facing_path: str,
     suggested_filename: str,
     png_size_bytes: int,
+    session_id: Optional[str] = None,
 ) -> str:
     """Build a SHORT (~400-byte) download hint for a freshly generated plot.
 
     This is the default download guidance every plot tool emits. It points
     the user at the three save mechanisms (right-click, LLM filesystem tool,
-    on-demand Python script) WITHOUT embedding the full base64 payload —
+    on-demand save guidance) WITHOUT embedding the full base64 payload —
     embedding it inline with every plot response would roughly double the
     response size and consume conversation context faster than necessary.
-    The embedded-script form is delivered separately by the `get_save_script`
-    tool only when the user explicitly asks for it.
+    The full guidance is delivered separately by the `get_save_script` tool
+    only when the user explicitly asks for it.
 
     Args:
         user_facing_path: where the user has asked files to be saved.
@@ -583,72 +768,385 @@ def _make_save_hint(
             this plot when the user later asks `get_save_script` for it.
         png_size_bytes: size of the PNG in bytes, shown to the user so they
             know what to expect.
+        session_id: the session that owns the plot. Defaults to the
+            session bound to the current call. When None AND no session is
+            bound (anonymous call under the lenient policy) the plot was NOT
+            registered, and the hint says so instead of advertising
+            fetch_plot.
     """
+    sid = session_id or _current_session_id()
     size_kb = max(1, png_size_bytes // 1024)
-    return (
+    head = (
         f"\n---\n"
         f"### Save `{suggested_filename}` ({size_kb} KB)\n\n"
         f"The plot above is included inline. To save it to "
         f"`{user_facing_path}` on your computer, use any of these:\n\n"
         f"- **Right-click the image above** → \"Save Image As…\" (works in "
         f"every chat UI that renders MCP images).\n"
+    )
+    if sid is None:
+        return head + (
+            f"- **Ask your LLM client to save it** if it has filesystem access "
+            f"(filesystem MCP server, Cline, Cursor, Claude Code).\n"
+            f"- _This call had no session, so the plot was not kept on the "
+            f"server for later retrieval. Call `create_session()` and pass the "
+            f"session_id to plot tools to enable `fetch_plot` / "
+            f"`get_save_script`._\n"
+        )
+    uri = f"plot://{sid}/{suggested_filename}"
+    return head + (
         f"- **Ask your LLM client to save it** if it has filesystem access "
         f"(filesystem MCP server, Cline, Cursor, Claude Code). If the inline "
         f"image is missing or rendered poorly, the LLM can call "
-        f"`fetch_plot(filename=\"{suggested_filename}\")` or read "
-        f"`plot://{suggested_filename}` to re-fetch the canonical bytes "
+        f"`fetch_plot(session_id=\"{sid}\", filename=\"{suggested_filename}\")` "
+        f"or read `{uri}` to re-fetch the canonical bytes "
         f"without re-rendering.\n"
         f"- **Get full save options:** call `get_save_script("
-        f"filename=\"{suggested_filename}\")` to receive a markdown block "
-        f"describing every available retrieval path (right-click, "
-        f"resource URI, fetch_plot).\n"
+        f"session_id=\"{sid}\", filename=\"{suggested_filename}\")` to receive "
+        f"a markdown block describing every available retrieval path "
+        f"(right-click, resource URI, fetch_plot).\n"
     )
 
 
-def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instructions: str = "", host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
-    mcp: FastMCP = FastMCP("mcp-genelab", dependencies=["neo4j", "pydantic"], instructions=instructions, host=host, port=port, stateless_http=True)
+def _install_http_routes(mcp: MCPServer, neo4j_driver: AsyncDriver, database: str) -> None:
+    """Register the plain-HTTP GET routes an ALB-fronted deployment needs.
 
-    # Plot resource layer: every plot generated by create_volcano_plot or
-    # create_venn_diagram is held in _LAST_PLOTS and exposed as an MCP
-    # resource under the plot://<suggested_filename> URI. Clients fetch the
-    # bytes via `resources/read` (or via the fetch_plot tool below) in a
-    # separate request from the tool call that produced the plot, so a
-    # failed fetch can be retried without re-running Cypher + matplotlib.
-    # The URI's filename is the same key the tools use to register and
-    # look up plots, so resource URIs are stable within a session.
+    The MCP endpoint (`/mcp`) is POST-only and cannot answer an ALB health
+    check (ALB health checks are always HTTP GET; default success matcher
+    200). Two routes are added to the Starlette app MCPServer builds:
+
+      GET /healthz  — liveness. No I/O; 200 as long as the process can serve
+                      a request. Use for the ECS container healthCheck.
+      GET /readyz   — readiness. Runs `RETURN 1` against Neo4j with a short
+                      timeout (MCP_READYZ_TIMEOUT_SECONDS, default 4 s — under
+                      the ALB's 5 s default health-check timeout); 200 when
+                      the KG is reachable, 503 otherwise. Use for the ALB
+                      target-group health check so a task whose Neo4j path is
+                      broken is pulled from rotation without being killed.
+      GET /metrics  — usage counters (only when MCP_METRICS_ENDPOINT=1; see
+                      mcp_genelab.metrics for why it is off by default).
+
+    Registered through MCPServer.custom_route so they live on the same app /
+    port as /mcp — no second server, no extra listener.
+    """
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, PlainTextResponse, Response
+
+    @mcp.custom_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
+    async def healthz(request: Request) -> Response:
+        return JSONResponse({"status": "ok", "service": "mcp-genelab", "version": __version__})
+
+    # /readyz is reachable by anyone who can reach the ALB, and every hit is a
+    # Neo4j round-trip. The last verdict is reused for READYZ_CACHE_SECONDS so
+    # a burst of probes costs at most one query per window; the ALB's own
+    # 30 s interval is far coarser than that.
+    _readyz_cache: dict[str, Any] = {"ts": 0.0, "body": None, "code": 503}
+
+    @mcp.custom_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
+    async def readyz(request: Request) -> Response:
+        now = time.monotonic()
+        if _readyz_cache["body"] is not None and (now - _readyz_cache["ts"]) < READYZ_CACHE_SECONDS:
+            return JSONResponse(_readyz_cache["body"], status_code=_readyz_cache["code"],
+                                headers={"Cache-Control": "no-store"})
+
+        async def _ping() -> None:
+            async with neo4j_driver.session(database=database, default_access_mode=READ_ACCESS) as s:
+                await s.execute_read(_read, "RETURN 1 AS ok", {})
+        try:
+            await asyncio.wait_for(_ping(), timeout=READYZ_TIMEOUT_SECONDS)
+            body, code = {"status": "ready", "neo4j": "ok"}, 200
+        except Exception as e:  # timeout, auth failure, unreachable, pool saturated…
+            logger.warning(f"readyz: Neo4j check failed: {type(e).__name__}: {_scrub_for_log(e)}")
+            body, code = {"status": "degraded", "neo4j": type(e).__name__}, 503
+        _readyz_cache.update(ts=time.monotonic(), body=body, code=code)
+        return JSONResponse(body, status_code=code, headers={"Cache-Control": "no-store"})
+
+    if _metrics.METRICS_ENDPOINT_ENABLED:
+        @mcp.custom_route("/metrics", methods=["GET"], include_in_schema=False)
+        async def metrics_route(request: Request) -> Response:
+            stats = SESSION_STORE.stats()
+            if "application/json" in (request.headers.get("accept") or ""):
+                return JSONResponse(_metrics.REGISTRY.snapshot(stats))
+            return PlainTextResponse(
+                _metrics.REGISTRY.prometheus_text(stats),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+
+
+def _install_usage_metrics(mcp: MCPServer) -> None:
+    """Wrap the SDK's tool dispatch so every tool call is timed and counted
+    (see mcp_genelab.metrics). Wrapping at the ToolManager level means the
+    24 tool bodies stay untouched, argument-validation failures raised by the
+    SDK are counted too, and — unlike a `ServerMiddleware`, which only runs
+    for messages that arrive over a transport — it also covers in-process
+    `MCPServer.call_tool` (the test harness).
+
+    `MCPServer.call_tool` looks `self._tool_manager.call_tool` up at call
+    time, so replacing the bound attribute is sufficient. The wrapper passes
+    *args/**kwargs through untouched so it is insensitive to signature
+    changes across mcp 2.x. If anything about this fails we log and leave
+    dispatch un-instrumented — metrics must never break tool calls.
+
+    The wrapper also resets the per-call session ContextVar afterwards, so a
+    session bound by one tool call can never bleed into a later call that
+    happens to run in the same context (e.g. two in-process calls in a row).
+    """
+    try:
+        manager = mcp._tool_manager
+        original = manager.call_tool
+    except AttributeError:  # pragma: no cover - SDK layout changed
+        logger.warning("usage metrics: ToolManager not found; tool calls will not be counted")
+        return
+
+    async def instrumented_call_tool(*args, **kwargs):
+        name = kwargs.get("name") if "name" in kwargs else (args[0] if args else "?")
+        arguments = kwargs.get("arguments") if "arguments" in kwargs else (args[1] if len(args) > 1 else None)
+        context = kwargs.get("context") if "context" in kwargs else (args[2] if len(args) > 2 else None)
+        sid = None
+        if isinstance(arguments, dict):
+            sid = arguments.get("session_id")
+        digest = _sessions.session_id_digest(sid)
+        client = _client_label(context)
+        client_fp = _client_fingerprint(context)
+        cv_token = _sessions.bind(None)
+        t0 = time.perf_counter()
+        status, err_type = "ok", None
+        try:
+            result = await original(*args, **kwargs)
+            # Tools report most failures as a TextContent starting with
+            # "Error" rather than raising; classify those as soft errors so
+            # the error counters reflect what the user actually saw. The
+            # result is a CallToolResult (mcp 2.x); tolerate a bare content
+            # list / (content, structured) tuple as well.
+            content = getattr(result, "content", result)
+            if isinstance(content, tuple) and len(content) == 2 and isinstance(content[0], (list, tuple)):
+                content = content[0]
+            first = content[0] if isinstance(content, (list, tuple)) and content else None
+            text = getattr(first, "text", None)
+            if getattr(result, "is_error", False) or (
+                isinstance(text, str) and text.lstrip().lower().startswith("error")
+            ):
+                status = "error"
+                err_type = "tool_error"
+            return result
+        except Exception as e:
+            status, err_type = "exception", type(e).__name__
+            raise
+        finally:
+            _sessions.unbind(cv_token)
+            duration_ms = (time.perf_counter() - t0) * 1000.0
+            _metrics.REGISTRY.record_tool_call(
+                str(name), duration_ms, status,
+                session_digest=digest, client=client, error_type=err_type,
+                client_fp=client_fp,
+            )
+
+    manager.call_tool = instrumented_call_tool  # type: ignore[method-assign]
+
+
+async def _client_identification_middleware(ctx, call_next):
+    """ServerMiddleware (mcp 2.x): record WHICH MCP client connected.
+
+    The MCP `initialize` handshake carries `clientInfo` (name/version — e.g.
+    "claude-ai", "chatgpt", "cursor", "mcp-remote") and the negotiated
+    `protocolVersion`; the HTTP User-Agent is a weaker second signal. Tool
+    calls do not repeat clientInfo, so it is logged once per handshake as a
+    `client_initialized` usage event, together with `client_fp` — the same
+    fingerprint that appears on that client's `session_created` and
+    `tool_call` events, which is how the two are joined in Logs Insights.
+    Runs only for messages that arrive over a transport; never blocks or
+    alters the handshake."""
+    if getattr(ctx, "method", None) == "initialize":
+        try:
+            params = ctx.params or {}
+            info = params.get("clientInfo") or {}
+            req = getattr(ctx, "request", None)
+            headers = {str(k).lower(): str(v) for k, v in (getattr(req, "headers", None) or {}).items()}
+            ua = headers.get("user-agent", "")
+            ip = _client_ip(headers)
+            fp = _metrics.fingerprint(f"{ip}|{ua}") if (ip or ua) else ""
+            _metrics.REGISTRY.record_client_initialized(
+                client_name=str(info.get("name", ""))[:80],
+                client_version=str(info.get("version", ""))[:40],
+                protocol_version=str(params.get("protocolVersion", ""))[:20],
+                client=ua,
+                client_fp=fp,
+            )
+        except Exception:  # identification must never break the handshake
+            pass
+    return await call_next(ctx)
+
+
+def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instructions: str = "") -> MCPServer:
+    """Build the MCPServer with all tools, the plot resource, the ALB health
+    routes and usage-metrics instrumentation.
+
+    Transport settings (host, port, stateless_http) are NOT constructor
+    arguments in mcp 2.x — they are passed to `run_streamable_http_async` /
+    `streamable_http_app` in `async_main`. See `STREAMABLE_HTTP_OPTIONS`.
+    """
+    # `version` is advertised in serverInfo during initialize; keyword
+    # arguments throughout because mcp 2.x inserted title/description before
+    # instructions in the positional order.
+    mcp = MCPServer(
+        name="mcp-genelab",
+        instructions=instructions,
+        version=__version__,
+        dependencies=["neo4j", "pydantic"],
+        middleware=[_client_identification_middleware],
+    )
+
+    _install_http_routes(mcp, neo4j_driver, database)
+    _install_usage_metrics(mcp)
+
+    # -----------------------------------------------------------------------
+    # Session lifecycle tools
+    # -----------------------------------------------------------------------
+
+    @mcp.tool(
+        annotations={
+            "title": "Create Session (call first)",
+            "readOnlyHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+    )
+    async def create_session(ctx: Context) -> list[types.TextContent]:
+        """Start a session and obtain the `session_id` that EVERY other tool
+        on this server requires.
+
+        WHEN TO USE THIS TOOL:
+        Call this ONCE at the beginning of a conversation, before any other
+        mcp-genelab tool. Also call it again whenever a tool replies that the
+        session is unknown or expired.
+
+        WHY:
+        This server runs as a single shared process serving many users at
+        once. The session id is the only thing that keeps YOUR output
+        directory and YOUR generated plots (retrievable via `fetch_plot`,
+        `get_save_script` and the `plot://{session_id}/{filename}` resource)
+        separate from everyone else's. It is an opaque bearer token —
+        treat it as private to this conversation and never guess one.
+
+        LIFETIME:
+        A session expires after a period of inactivity (default 60 min) or an
+        absolute maximum age (default 8 h), whichever comes first. Expired
+        sessions drop their plots; regenerate them under a new session.
+
+        RETURNS:
+        A short message containing `session_id: <token>`. Extract the token
+        and pass it as the `session_id` argument on every subsequent call.
+        """
+        client = _client_label(ctx)
+        client_fp = _client_fingerprint(ctx)
+        try:
+            state = SESSION_STORE.create(client_label=client)
+        except SessionError as e:
+            _metrics.REGISTRY.record_session_rejected(e.reason, "create_session")
+            logger.warning(f"create_session refused: {e.reason} (live={len(SESSION_STORE)})")
+            return _session_error_content(e)
+        state.client_fp = client_fp
+        _metrics.REGISTRY.record_session_created(
+            client, session_digest=_sessions.session_id_digest(state.session_id), client_fp=client_fp
+        )
+        logger.info(
+            f"session created ({_sessions.session_id_digest(state.session_id)}) "
+            f"live={len(SESSION_STORE)} client={_scrub_for_log(client, 60)!r}"
+        )
+        idle_min = int(_sessions.SESSION_IDLE_TTL_SECONDS // 60)
+        max_h = int(_sessions.SESSION_MAX_AGE_SECONDS // 3600)
+        return [types.TextContent(
+            type="text",
+            text=(
+                f"session_id: {state.session_id}\n\n"
+                f"Pass this value as the `session_id` argument on EVERY subsequent "
+                f"tool call. The session expires after {idle_min} minutes of "
+                f"inactivity or {max_h} hours total; if a tool reports the session "
+                f"as unknown or expired, call `create_session()` again."
+            ),
+        )]
+
+    @mcp.tool(
+        annotations={
+            "title": "End Session",
+            "readOnlyHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
+    async def end_session(
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
+        """End a session immediately, discarding its output-directory setting
+        and all plots it holds. Optional — sessions also expire on their own.
+        Call it when the user is done, to free server memory promptly. After
+        this, a new `create_session()` is needed before further tool calls."""
+        try:
+            _resolve_session(session_id, "end_session")
+        except SessionError as e:
+            return _session_error_content(e)
+        sid = _current_session_id() or (session_id or "").strip()
+        ended = SESSION_STORE.end(sid)
+        _sessions.bind(None)
+        logger.info(f"session ended ({_sessions.session_id_digest(sid)}) ended={ended}")
+        return [types.TextContent(
+            type="text",
+            text="Session ended. Call `create_session()` to start a new one.",
+        )]
+
+    # -----------------------------------------------------------------------
+    # Plot resource layer
+    # -----------------------------------------------------------------------
+    # Every plot generated by create_volcano_plot or create_venn_diagram is
+    # held in the calling session's registry and exposed as an MCP resource
+    # under plot://{session_id}/{filename}. Clients fetch the bytes via
+    # `resources/read` (or via the fetch_plot tool below) in a separate
+    # request from the tool call that produced the plot, so a failed fetch
+    # can be retried without re-running Cypher + matplotlib. The session id
+    # is part of the URI because resources/read carries no other argument —
+    # it is what makes one session's plot unaddressable from another.
 
     @mcp.resource(
-        "plot://{filename}",
+        "plot://{session_id}/{filename}",
         name="plot",
         title="Plot PNG (Volcano / Venn)",
         description=(
             "Binary PNG bytes for a plot previously generated by "
-            "create_volcano_plot or create_venn_diagram. The {filename} "
-            "parameter is the suggested_filename surfaced in the plot "
-            "tool's response (e.g. 'venn_expression_2way_OSD-244.png'). "
-            "The server keeps the last 8 plots in memory; older plots "
-            "are evicted FIFO. Retrieve the same plot again by re-fetching "
-            "this URI — no need to re-render."
+            "create_volcano_plot or create_venn_diagram in the session "
+            "{session_id}. The {filename} parameter is the suggested_filename "
+            "surfaced in the plot tool's response (e.g. "
+            "'venn_expression_2way_OSD-244.png'). Each session keeps its last "
+            f"{MAX_LAST_PLOTS} plots in memory; older plots are evicted FIFO. "
+            "Retrieve the same plot again by re-fetching this URI — no need "
+            "to re-render."
         ),
         mime_type="image/png",
     )
-    def plot_resource(filename: str) -> bytes:
-        """Return the PNG bytes for a registered plot, or raise ValueError if
-        the plot is not in the registry. FastMCP base64-encodes the bytes into
-        a BlobResourceContents automatically and delivers them via resources/read.
+    def plot_resource(session_id: str, filename: str) -> bytes:
+        """Return the PNG bytes for a registered plot, or raise ResourceError
+        if the plot is not in that session's registry. MCPServer base64-encodes
+        the bytes into a BlobResourceContents automatically and delivers them
+        via resources/read.
 
         Notes:
-          - This is a READ-ONLY accessor. It does not mutate the registry.
+          - READ-ONLY accessor; does not mutate the registry.
           - Repeated reads of the same URI return the same bytes (idempotent).
-          - If the plot has been evicted by the FIFO bound, the caller gets a
-            clear error and can re-run the plot tool to regenerate it.
+          - Unknown/expired session or evicted plot → clear error; re-run the
+            plot tool (under a live session) to regenerate.
         """
+        # ResourceError (not ValueError): in mcp 2.x only ResourceError's
+        # message is passed through to the client; any other exception is
+        # wrapped into an opaque "Error creating resource from template".
+        try:
+            _resolve_session(session_id, "plot_resource")
+        except SessionError as e:
+            raise ResourceError(str(e)) from None
         looked_up = _lookup_plot(filename)
         if looked_up is None:
             available = ", ".join(_list_registered_plots()) or "(none)"
-            raise ValueError(
-                f"No plot named {filename!r} is in the registry. "
-                f"Available plots: {available}. The registry holds the "
+            raise ResourceError(
+                f"No plot named {filename!r} is in this session's registry. "
+                f"Available plots: {available}. Each session holds its "
                 f"last {MAX_LAST_PLOTS} plots; older entries are evicted."
             )
         png_bytes, _user_facing_path = looked_up
@@ -676,11 +1174,12 @@ def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instru
                 "(e.g. 'venn_expression_2way_OSD-244.png'). Look at the "
                 "most recent create_volcano_plot or create_venn_diagram "
                 "response — the filename appears in the 'Save' block. "
-                "The server keeps the last 8 plots in memory."
+                "Each session keeps its last 8 plots in memory."
             ),
         ),
-    ) -> list[types.Content]:
-        """Re-fetch the PNG bytes of a previously generated plot.
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.ContentBlock]:
+        """Re-fetch the PNG bytes of a plot previously generated IN THIS SESSION.
 
         WHEN TO USE THIS TOOL:
         Call this when you need the canonical PNG bytes for a plot that's
@@ -702,15 +1201,21 @@ def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instru
 
         EQUIVALENT RESOURCE URI:
         This tool returns the same bytes that `resources/read` would return
-        for `plot://<filename>`. Use whichever path your client supports
-        better — resources for clients that render them well, this tool for
-        clients that don't.
+        for `plot://<session_id>/<filename>`. Use whichever path your client
+        supports better — resources for clients that render them well, this
+        tool for clients that don't.
 
         REGISTRY BOUNDS:
-        The registry holds the last 8 plots (FIFO eviction). Older plots
-        return a clear "not in registry" error and need to be regenerated
-        by re-running the source plot tool.
+        Each session holds its last 8 plots (FIFO eviction). Older plots,
+        and plots from other or expired sessions, return a clear "not in
+        registry" error and need to be regenerated by re-running the source
+        plot tool under the current session.
         """
+        try:
+            _resolve_session(session_id, "fetch_plot")
+        except SessionError as e:
+            return _session_error_content(e)
+
         if not filename or not filename.strip():
             return [types.TextContent(
                 type="text",
@@ -724,24 +1229,25 @@ def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instru
         if looked_up is None:
             available = _list_registered_plots()
             hint = (
-                "Available plots: " + ", ".join(f"`{p}`" for p in available)
+                "Available plots in this session: " + ", ".join(f"`{p}`" for p in available)
                 if available
-                else "No plots are currently in the registry."
+                else "No plots are currently in this session's registry."
             )
             return [types.TextContent(
                 type="text",
                 text=(
-                    f"No plot named `{filename}` is in the registry "
-                    f"(only the last {MAX_LAST_PLOTS} plots are retained).\n\n"
+                    f"No plot named `{filename}` is in this session's registry "
+                    f"(only the last {MAX_LAST_PLOTS} plots per session are retained).\n\n"
                     f"{hint}\n\n"
                     f"Re-run create_volcano_plot or create_venn_diagram with "
-                    f"the same arguments to regenerate."
+                    f"the same arguments (and this session_id) to regenerate."
                 ),
             )]
 
         png_bytes, user_facing_path = looked_up
         b64 = base64.standard_b64encode(png_bytes).decode("ascii")
         size_kb = max(1, len(png_bytes) // 1024)
+        uri = _plot_uri(filename)
 
         # Return as EmbeddedResource so the client can render the bytes
         # inline using the resource UI, with the plot:// URI as the canonical
@@ -752,7 +1258,7 @@ def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instru
                 type="text",
                 text=(
                     f"Returning PNG bytes for `{filename}` ({size_kb} KB). "
-                    f"Canonical URI: `plot://{filename}`. "
+                    f"Canonical URI: `{uri}`. "
                     f"Local save path (if filesystem write is available): "
                     f"`{user_facing_path}`."
                 ),
@@ -760,8 +1266,8 @@ def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instru
             types.EmbeddedResource(
                 type="resource",
                 resource=types.BlobResourceContents(
-                    uri=f"plot://{filename}",
-                    mimeType="image/png",
+                    uri=uri,
+                    mime_type="image/png",
                     blob=b64,
                 ),
             ),
@@ -775,16 +1281,22 @@ def create_mcp_server(neo4j_driver: AsyncDriver, database: str = "neo4j", instru
             "openWorldHint": False,
         },
     )
-    async def get_neo4j_schema() -> list[types.TextContent]:
+    async def get_neo4j_schema(
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
         """List all nodes, their attributes and their relationships to other nodes in the neo4j database.
         If this fails with a message that includes "Neo.ClientError.Procedure.ProcedureNotFound"
         suggest that the user install and enable the APOC plugin.
         """
+        try:
+            _resolve_session(session_id, "get_neo4j_schema")
+        except SessionError as e:
+            return _session_error_content(e)
 
         get_schema_query = """
 call apoc.meta.data() yield label, property, type, other, unique, index, elementType
 where elementType = 'node' and not label starts with '_'
-with label, 
+with label,
     collect(case when type <> 'RELATIONSHIP' then [property, type + case when unique then " unique" else "" end + case when index then " indexed" else "" end] end) as attributes,
     collect(case when type = 'RELATIONSHIP' then [property, head(other)] end) as relationships
 RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(relationships) as relationships
@@ -824,46 +1336,47 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 "with pathlib). Avoid trailing path separators."
             ),
         ),
+        session_id: Optional[str] = _session_id_field(),
     ) -> list[types.TextContent]:
-        """Configure the output directory for files generated by this MCP server.
+        """Configure the output directory for files generated in THIS SESSION.
 
         WHEN TO USE THIS TOOL:
-        Call this tool at the START of a session, before any tool that produces
-        a downloadable file (create_volcano_plot, create_venn_diagram, or any
-        tool that emits a CSV). The path you specify is where the user wants
-        finished files to end up on THEIR OWN local machine.
+        Call this tool at the START of a session (right after create_session),
+        before any tool that produces a downloadable file (create_volcano_plot,
+        create_venn_diagram, or any tool that emits a CSV). The path you
+        specify is where the user wants finished files to end up on THEIR OWN
+        local machine.
 
         WHAT IT DOES:
-        Stores the provided path string in the server's session-scoped state.
-        Every subsequent file-producing tool uses this path:
+        Stores the provided path string in the server's session-scoped state
+        (keyed on your session_id — other sessions cannot see or change it).
+        Every subsequent file-producing tool in this session uses this path:
           - As the user-facing save location shown in the response summary.
-          - As the default target path embedded in the download-helper script
-            included with every plot.
+          - As the default target path in the save guidance emitted with
+            every plot.
           - If the server is running locally (stdio transport), the server
             ALSO writes the file directly to this path.
 
         IMPORTANT — DEPLOYMENT REALITY:
-        When this MCP server is deployed on AWS Bedrock AgentCore Runtime (or
-        any other remote container service), the server runs in an ephemeral
-        microVM whose filesystem is NOT reachable from the user's machine. The
-        server CANNOT write a file directly to the user's local disk over the
-        network — no MCP server in a container can. The path you set here is
-        a suggestion that propagates through the response in three ways, any
-        of which lets the user save the file locally:
+        When this MCP server is deployed remotely (ECS Fargate or any other
+        container service), it runs in a container whose filesystem is NOT
+        reachable from the user's machine. The server CANNOT write a file
+        directly to the user's local disk over the network — no MCP server in
+        a container can. The path you set here is a suggestion that propagates
+        through the response in three ways, any of which lets the user save
+        the file locally:
           (a) The plot is returned inline as ImageContent and renders in any
               MCP client that displays images (Claude Desktop, Cursor, Cline,
-              Claude.ai web, ChatGPT custom GPTs, Gemini, etc.). The user can
-              right-click and "Save Image As" — most clients default to the
-              user's Downloads folder, which is usually what was asked for.
-          (b) The path you set appears in a download-helper script in the
-              response. LLM clients with local filesystem access (Claude Code,
-              Cursor, Cline, Claude Desktop with a filesystem MCP server) can
-              run this script automatically to write the file at exactly this
-              path.
-          (c) Users without LLM-mediated filesystem access can copy the
-              script into a file and run `python save_plot.py` themselves on
-              their own machine. This is cross-platform (macOS/Linux/Windows)
-              and uses no third-party packages.
+              Claude.ai web, ChatGPT, Gemini, etc.). The user can right-click
+              and "Save Image As" — most clients default to the user's
+              Downloads folder, which is usually what was asked for.
+          (b) The path you set appears in the save guidance in the response.
+              LLM clients with local filesystem access (Claude Code, Cursor,
+              Cline, Claude Desktop with a filesystem MCP server) can write
+              the file at exactly this path, re-fetching the canonical bytes
+              via `fetch_plot` or the `plot://` resource if needed.
+          (c) Users without LLM-mediated filesystem access can save the
+              inline image or the inline CSV text themselves.
 
         VALIDATION:
         The path is stored as-is (the server does not verify it exists on the
@@ -872,6 +1385,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         will accept it; the failure will surface when the user tries to save
         the file locally.
         """
+        try:
+            _resolve_session(session_id, "set_output_directory")
+        except SessionError as e:
+            return _session_error_content(e)
+
         if not path or not path.strip():
             return [types.TextContent(
                 type="text",
@@ -881,11 +1399,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         # Path hygiene. NOTE ON THREAT MODEL: in remote deployment the server
         # never writes to this path (see _write_csv / plot save, both gated on
         # `not _is_remote_deployment()`), so this is not a path-traversal sink on
-        # the public endpoint — the string is only echoed back to the same user
-        # and embedded in the save script they run on THEIR machine. Validation
-        # here is (a) defense-in-depth for local stdio mode, where the server
-        # DOES write, and (b) hygiene so a malformed/oversized/newline-laden
-        # value can't corrupt the response or the logs.
+        # the public endpoint — the string is only echoed back to the same
+        # session and shown in that user's save guidance. Validation here is
+        # (a) defense-in-depth for local stdio mode, where the server DOES
+        # write, and (b) hygiene so a malformed/oversized/newline-laden value
+        # can't corrupt the response or the logs.
         cleaned = path.strip().rstrip('/').rstrip('\\')
 
         if len(cleaned) > 4096:
@@ -911,23 +1429,26 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         _set_user_output_dir(cleaned)
 
         deployment_mode = (
-            "remote (AgentCore / streamable-http)"
+            "remote (streamable-http)"
             if _is_remote_deployment() else "local (stdio)"
         )
-        logger.info(f"Output directory set to: {cleaned} (deployment: {deployment_mode})")
+        logger.info(
+            f"Output directory set ({_sessions.session_id_digest(_current_session_id())}): "
+            f"{_scrub_for_log(cleaned)} (deployment: {deployment_mode})"
+        )
 
         if _is_remote_deployment():
             advisory = (
-                f"\n\n**Deployment note:** This MCP server runs in an ephemeral "
+                f"\n\n**Deployment note:** This MCP server runs in a remote "
                 f"container that cannot directly write to your local "
                 f"filesystem. Every plot tool will:\n"
                 f"  1. Return the image inline (renders in chat — right-click "
                 f"to Save As, which typically goes to your Downloads folder).\n"
                 f"  2. Include a short save hint pointing at `{cleaned}`.\n"
-                f"  3. Make the plot retrievable via `get_save_script("
-                f"filename=...)`, which returns a self-contained Python "
-                f"script that writes the plot to `{cleaned}` on your machine "
-                f"when run with `python save_plot.py`.\n\n"
+                f"  3. Keep the plot retrievable for this session via "
+                f"`fetch_plot(session_id=..., filename=...)`, the "
+                f"`plot://<session_id>/<filename>` resource, and "
+                f"`get_save_script(session_id=..., filename=...)`.\n\n"
                 f"Tables produced by the data tools (find_differentially_*, "
                 f"find_common_*, get_study_info) are also returned with their "
                 f"CSV text inline in the response, so you can copy-paste or "
@@ -957,12 +1478,20 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             "openWorldHint": False,
         },
     )
-    async def get_output_directory() -> list[types.TextContent]:
+    async def get_output_directory(
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
         """Return the currently-configured output directory for this session.
 
-        Returns the path previously set by set_output_directory, or a note
-        explaining that no path has been set yet (and how to set one).
+        Returns the path previously set by set_output_directory in the same
+        session, or a note explaining that no path has been set yet (and how
+        to set one).
         """
+        try:
+            _resolve_session(session_id, "get_output_directory")
+        except SessionError as e:
+            return _session_error_content(e)
+
         current = _get_user_output_dir()
         if current:
             return [types.TextContent(
@@ -996,11 +1525,12 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 "Look at the most recent create_volcano_plot or "
                 "create_venn_diagram response — the filename appears in the "
                 "'Save' block. Omit this parameter to list the filenames of "
-                "all plots currently available in the registry."
+                "all plots currently available in this session's registry."
             ),
         ),
+        session_id: Optional[str] = _session_id_field(),
     ) -> list[types.TextContent]:
-        """Return guidance for saving a previously generated plot to the
+        """Return guidance for saving a plot generated in THIS SESSION to the
         user's local filesystem.
 
         WHEN TO USE THIS TOOL:
@@ -1015,16 +1545,17 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
         HOW IT WORKS:
         Each plot tool registers the PNG bytes of the plot it generated in
-        a per-session registry (up to the last 8 plots; older entries are
-        evicted FIFO). Calling this tool with the plot's suggested filename
-        returns a markdown block with three save options:
+        the calling session's registry (up to the last 8 plots; older
+        entries are evicted FIFO). Calling this tool with the plot's
+        suggested filename returns a markdown block with three save options:
 
           - Option A (right-click save on the inline image)
           - Option B (ask your LLM client to save via filesystem access,
             optionally re-fetching the canonical bytes through fetch_plot
             or the plot:// resource if the inline image was corrupted)
           - Option C (fetch the canonical PNG bytes via resources/read on
-            the plot:// URI for clients that support MCP resources)
+            the plot://<session_id>/<filename> URI for clients that support
+            MCP resources)
 
         The response itself contains no PNG bytes — only references to the
         plot:// resource URI and the fetch_plot tool, both of which deliver
@@ -1032,9 +1563,15 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
         LISTING AVAILABLE PLOTS:
         Call this tool with no `filename` argument to list the filenames
-        of all plots currently held in the registry. Useful when the user
-        asks for save guidance but doesn't remember which plot they want.
+        of all plots currently held in this session's registry. Useful when
+        the user asks for save guidance but doesn't remember which plot they
+        want.
         """
+        try:
+            _resolve_session(session_id, "get_save_script")
+        except SessionError as e:
+            return _session_error_content(e)
+
         # Listing mode: no filename → return the catalogue.
         if not filename or not filename.strip():
             available = _list_registered_plots()
@@ -1044,17 +1581,18 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     text=(
                         "No plots are currently available for save-script "
                         "retrieval in this session. Generate a plot first "
-                        "(create_volcano_plot or create_venn_diagram) and "
-                        "then call this tool again with the plot's filename."
+                        "(create_volcano_plot or create_venn_diagram, passing "
+                        "this session_id) and then call this tool again with "
+                        "the plot's filename."
                     ),
                 )]
             bullets = "\n".join(f"  - `{f}`" for f in available)
             return [types.TextContent(
                 type="text",
                 text=(
-                    f"Plots currently available for save-script retrieval "
-                    f"(call `get_save_script(filename=...)` to receive the "
-                    f"Python save script for any of these):\n\n{bullets}"
+                    f"Plots currently available for save-script retrieval in "
+                    f"this session (call `get_save_script(filename=...)` to "
+                    f"receive the save guidance for any of these):\n\n{bullets}"
                 ),
             )]
 
@@ -1064,8 +1602,9 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             available = _list_registered_plots()
             if not available:
                 hint = (
-                    "No plots are currently in the registry. Generate one "
-                    "first (create_volcano_plot or create_venn_diagram)."
+                    "No plots are currently in this session's registry. "
+                    "Generate one first (create_volcano_plot or "
+                    "create_venn_diagram, passing this session_id)."
                 )
             else:
                 bullets = "\n".join(f"  - `{f}`" for f in available)
@@ -1073,26 +1612,26 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     f"Available filenames:\n\n{bullets}\n\n"
                     f"If the plot you want isn't listed, it may have been "
                     f"evicted from the registry (only the last "
-                    f"{MAX_LAST_PLOTS} plots are retained). Regenerate the "
-                    f"plot and try again."
+                    f"{MAX_LAST_PLOTS} plots per session are retained) or it "
+                    f"was generated under a different session. Regenerate "
+                    f"the plot and try again."
                 )
             return [types.TextContent(
                 type="text",
                 text=(
-                    f"No plot named `{filename}` is in the registry.\n\n"
+                    f"No plot named `{filename}` is in this session's registry.\n\n"
                     f"{hint}"
                 ),
             )]
 
         png_bytes, user_facing_path = looked_up
-        # The save instructions now reference the canonical plot:// resource
-        # URI rather than embedding the base64 payload inline. This keeps the
+        # The save instructions reference the canonical plot:// resource URI
+        # rather than embedding the base64 payload inline. This keeps the
         # response small (~1 KB regardless of PNG size) and gives the client
         # a retry-safe path to the bytes via resources/read or fetch_plot.
         return [types.TextContent(
             type="text",
             text=_make_save_instructions(user_facing_path, filename, len(png_bytes)),
-            mimeType="text/markdown",
         )]
 
     @mcp.tool(
@@ -1108,6 +1647,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         params: Optional[dict[str, Any]] = Field(
             None, description="The parameters to pass to the Cypher query."
         ),
+        session_id: Optional[str] = _session_id_field(),
     ) -> list[types.TextContent]:
         """FALLBACK Cypher executor. Use this ONLY when no specialist tool covers the question.
 
@@ -1130,6 +1670,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
           - factor-pair → assay-id resolution (e.g. "give me the assay for
             Space Flight,Carcass vs Ground Control,Carcass in OSD-48")
                 → select_assays(study_id=..., selection=...)
+          - "what groups / conditions / control and experimental (treatment)
+            groups are in study X", "what comparisons does OSD-48 have",
+            "which factors were compared" — any question about the groups a
+            study contains, even with no factor pair named
+                → select_assays(study_id=...)   (list mode; omit `selection`)
           - common DEGs/DMRs/DA organisms across multiple assays, intersections
                 → find_common_differentially_expressed_genes(assay_ids=[...])
                 → find_common_differentially_methylated_regions(assay_ids=[...])
@@ -1221,6 +1766,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         WRONG: g.gene_symbol   RIGHT: g.symbol
         WRONG: g.gene_name     RIGHT: g.name
         """
+        try:
+            _resolve_session(session_id, "query")
+        except SessionError as e:
+            return _session_error_content(e)
+
 
         # Reject writes AND read-only-but-dangerous procedures (network I/O,
         # export, DBMS admin) before anything reaches Neo4j. READ_ACCESS on the
@@ -1320,8 +1870,15 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             "openWorldHint": False,
         },
     )
-    async def get_node_metadata() -> list[types.TextContent]:
+    async def get_node_metadata(
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
         """Get metadata for all nodes from MetaNode nodes in the knowledge graph."""
+        try:
+            _resolve_session(session_id, "get_node_metadata")
+        except SessionError as e:
+            return _session_error_content(e)
+
 
         metadata_query = """
         MATCH (m:MetaNode)
@@ -1352,8 +1909,15 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             "openWorldHint": False,
         },
     )
-    async def get_relationship_metadata() -> list[types.TextContent]:
+    async def get_relationship_metadata(
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
         """Get descriptions of properties of all relationships in the knowledge graph."""
+        try:
+            _resolve_session(session_id, "get_relationship_metadata")
+        except SessionError as e:
+            return _session_error_content(e)
+
 
         metadata_query = """
         MATCH (n1)-[r:MetaRelationship]->(n2)
@@ -1423,7 +1987,8 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         },
     )
     async def get_study_info(
-        study_id: str = Field(..., description="Study identifier (e.g., 'OSD-267')")
+        study_id: str = Field(..., description="Study identifier (e.g., 'OSD-267')"),
+        session_id: Optional[str] = _session_id_field(),
     ) -> list[types.TextContent]:
         """USE THIS TOOL (not the `query` tool) for any study-metadata question:
         "what assays does study X have", "tell me about OSD-267", project title,
@@ -1443,6 +2008,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         For example, OSD-267 should return that it has both 16S and ITS amplicon sequencing data.
 
         """
+        try:
+            _resolve_session(session_id, "get_study_info")
+        except SessionError as e:
+            return _session_error_content(e)
+
         
         study_cypher = """
         MATCH (s:Study {identifier: $study_id})
@@ -1580,7 +2150,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 lines.append("*No assays found for this study.*")
 
             return [
-                types.TextContent(type="text", text="\n".join(lines), mimeType="text/markdown"),
+                types.TextContent(type="text", text="\n".join(lines)),
             ]
         
         except Exception as e:
@@ -1597,14 +2167,28 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
     )
     async def select_assays(
         study_id: Optional[str] = None,
-        selection: Optional[str] = None
-    ) -> list[types.Content]:
-        """USE THIS TOOL (not the `query` tool) to resolve a factor-pair condition
-        (e.g. "Space Flight,Carcass vs Ground Control,Carcass") into the
-        matching assay identifier(s) for a study. Falling back to `query` for
-        this category loses the numbered factor menu, the per-match
-        technology/measurement/method columns, and the next-step suggestions
-        this tool emits.
+        selection: Optional[str] = None,
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.ContentBlock]:
+        """USE THIS TOOL (not the `query` tool) for ANY question about the
+        groups a study contains, and to resolve a factor-pair condition into
+        the matching assay identifier(s):
+
+          - "What groups / conditions / control and experimental (treatment)
+            groups are in OSD-48?", "which comparisons or factors does this
+            study have?", "what was compared against what?" — call with just
+            `study_id` (list mode). The numbered factor menu it returns IS the
+            list of groups: each entry is one experimental group (a set of
+            factor values such as "Space Flight,Carcass"), and each assay is a
+            comparison of two such groups (condition 1 vs condition 2, e.g.
+            experimental vs control). Never use `query` for this.
+          - "Give me the assay for Space Flight,Carcass vs Ground
+            Control,Carcass" — call with `study_id` and `selection` to resolve
+            that factor pair (e.g. "2,1") into assay identifier(s).
+
+        Falling back to `query` for this category loses the numbered factor
+        menu, the per-match technology/measurement/method columns, and the
+        next-step suggestions this tool emits.
 
         List and select assays for a study and render the response in markdown format.
 
@@ -1623,6 +2207,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
           amplicon for organism abundance) WITHOUT issuing a follow-up
           Cypher query.
         """
+        try:
+            _resolve_session(session_id, "select_assays")
+        except SessionError as e:
+            return _session_error_content(e)
+
         if not study_id:
             return [types.TextContent(type="text", text="Please provide a study_id (e.g., OSD-253).")]
 
@@ -1691,7 +2280,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 lines.append(f"| {i} | {_fmt(arr)} |")
 
             return [
-                types.TextContent(type="text", text="\n".join(lines), mimeType="text/markdown"),
+                types.TextContent(type="text", text="\n".join(lines)),
             ]
 
         parts = [p for p in re.split(r"[,\s]+", selection.strip()) if p]
@@ -1810,7 +2399,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             lines.append("5. Create a venn diagram to show overlap of common differentially expressed genes")
         
         return [
-            types.TextContent(type="text", text="\n".join(lines), mimeType="text/markdown"),
+            types.TextContent(type="text", text="\n".join(lines)),
         ]
     
     @mcp.tool(
@@ -1834,7 +2423,8 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 "CSV contains every row passing the filter."
             ),
         ),
-        adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for significance (default: 0.05). Only genes with adj_p_value <= this value are returned.")
+        adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for significance (default: 0.05). Only genes with adj_p_value <= this value are returned."),
+        session_id: Optional[str] = _session_id_field(),
     ) -> list[types.TextContent]:
         """USE THIS TOOL (not the `query` tool) for any "up/down-regulated genes",
         "DEGs", or "differential expression" question for a single assay.
@@ -1860,6 +2450,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         and group means and standard deviations for each condition.
 
         """
+        try:
+            _resolve_session(session_id, "find_differentially_expressed_genes")
+        except SessionError as e:
+            return _session_error_content(e)
+
 
         factors_cypher = """
         MATCH (a:Assay {identifier: $assay_id})
@@ -2020,7 +2615,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             ))
 
             return [
-                types.TextContent(type="text", text="\n".join(human_lines), mimeType="text/markdown"),
+                types.TextContent(type="text", text="\n".join(human_lines)),
             ]
     
         except Exception as e:
@@ -2118,6 +2713,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 "Useful for narrowing to regions tightly associated with gene bodies."
             ),
         ),
+        session_id: Optional[str] = _session_id_field(),
     ) -> list[types.TextContent]:
         """USE THIS TOOL (not the `query` tool) for any "hyper/hypo-methylated
         regions", "DMRs", or "differential methylation" question — including
@@ -2170,6 +2766,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         that the user can save directly. Falling back to direct Cypher loses
         the formatted output and the CSV.
         """
+        try:
+            _resolve_session(session_id, "find_differentially_methylated_regions")
+        except SessionError as e:
+            return _session_error_content(e)
+
 
         # Normalize assay_id to a list so the pooled and single-assay paths
         # share a single implementation. The Cypher always uses
@@ -2467,7 +3068,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             ))
 
             return [
-                types.TextContent(type="text", text="\n".join(human_lines), mimeType="text/markdown"),
+                types.TextContent(type="text", text="\n".join(human_lines)),
             ]
 
         except Exception as e:
@@ -2499,7 +3100,8 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for DESeq2 abundance assays (default: 0.05). Applied to rows with adj_p_value populated."),
         q_value_threshold: float = Field(0.05, description="q-value threshold for ANCOM-BC abundance assays (default: 0.05). Applied to rows with q_value populated."),
         log2fc_threshold: float = Field(0.0, description="Minimum |log2fc| magnitude required for a row to be kept (default: 0.0 = any change). Applies to BOTH DESeq2 and ANCOM-BC rows since log2fc is populated for both methods."),
-        lnfc_threshold: Optional[float] = Field(None, description="Optional minimum |lnfc| magnitude. Only applied to rows with lnfc populated (ANCOM-BC). DESeq2 rows are not filtered by this parameter. Leave unset (None) to skip lnfc filtering entirely.")
+        lnfc_threshold: Optional[float] = Field(None, description="Optional minimum |lnfc| magnitude. Only applied to rows with lnfc populated (ANCOM-BC). DESeq2 rows are not filtered by this parameter. Leave unset (None) to skip lnfc filtering entirely."),
+        session_id: Optional[str] = _session_id_field(),
     ) -> list[types.TextContent]:
         """USE THIS TOOL (not the `query` tool) for any "differentially abundant
         organisms", DESeq2/ANCOM-BC abundance, or "increased/decreased
@@ -2543,6 +3145,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         Results include organism name, log2fc, lnfc, q-value, adj-p-value,
         and group means and standard deviations.
         """
+        try:
+            _resolve_session(session_id, "find_differentially_abundant_organisms")
+        except SessionError as e:
+            return _session_error_content(e)
+
 
         factors_cypher = """
         MATCH (a:Assay {identifier: $assay_id})
@@ -2739,7 +3346,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 human_lines.append(f"\n_CSV: `{down_csv_path}`_")
 
             return [
-                types.TextContent(type="text", text="\n".join(human_lines), mimeType="text/markdown"),
+                types.TextContent(type="text", text="\n".join(human_lines)),
             ]
     
         except Exception as e:
@@ -2757,8 +3364,9 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
     async def find_common_differentially_expressed_genes(
             assay_ids: list[str] = Field(..., description="List of assay identifiers (e.g., ['OSD-253-abc123', 'OSD-253-def456'])"),
             log2fc_threshold: float = Field(1.0, description="Log2 fold change threshold for filtering genes (default: 1.0 = 2-fold change)"),
-            adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for significance (default: 0.05, max value: 0.1)")
-        ) -> list[types.TextContent]:
+            adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for significance (default: 0.05, max value: 0.1)"),
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
             """USE THIS TOOL (not the `query` tool) for any "common DEGs across
             assays", "genes upregulated in BOTH assays", "shared
             up/downregulated genes", or any cross-assay DE intersection
@@ -2778,6 +3386,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             4. Returns a markdown table with columns: gene, assay_1, assay_2, ..., assay_n showing log2fc values
             
             """
+            try:
+                _resolve_session(session_id, "find_common_differentially_expressed_genes")
+            except SessionError as e:
+                return _session_error_content(e)
+
             
             if len(assay_ids) < 2:
                 return [types.TextContent(
@@ -2920,7 +3533,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 for i, assay_id in enumerate(assay_ids):
                     markdown_output += f"- **Assay {i+1}:** {assay_id}\n"
 
-                return [types.TextContent(type="text", text=markdown_output, mimeType="text/markdown")]
+                return [types.TextContent(type="text", text=markdown_output)]
 
             except Exception as e:
                 logger.error(f"Error finding correlated differentially expressed genes: {e}")
@@ -2968,7 +3581,8 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     "(default) imposes no distance filter."
                 ),
             ),
-        ) -> list[types.TextContent]:
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
             """USE THIS TOOL (not the `query` tool) for any "common DMRs
             across assays", "genes hypermethylated in BOTH assays", "shared
             hyper/hypomethylated regions", or any cross-assay methylation
@@ -2997,6 +3611,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             are applied during the Cypher query so the common gene set reflects
             the filtered universe correctly.
             """
+            try:
+                _resolve_session(session_id, "find_common_differentially_methylated_regions")
+            except SessionError as e:
+                return _session_error_content(e)
+
 
             if len(assay_ids) < 2:
                 return [types.TextContent(type="text", text="Error: Please provide at least 2 assay IDs.")]
@@ -3141,7 +3760,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 for i, aid in enumerate(assay_ids):
                     md += f"- **Assay {i+1}:** {aid}\n"
 
-                return [types.TextContent(type="text", text=md, mimeType="text/markdown")]
+                return [types.TextContent(type="text", text=md)]
 
             except Exception as e:
                 logger.error(f"Error finding common differentially methylated regions: {e}")
@@ -3160,8 +3779,9 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             log2fc_threshold: float = Field(0.0, description="Minimum |log2fc| magnitude for filtering organisms (default: 0.0 = any change). Applied to BOTH DESeq2 and ANCOM-BC rows since log2fc is populated for both methods."),
             q_value_threshold: float = Field(0.05, description="q-value threshold for ANCOM-BC abundance assays (default: 0.05). Applied to rows with q_value populated."),
             adj_p_threshold: float = Field(0.05, description="Adjusted p-value threshold for DESeq2 abundance assays (default: 0.05). Applied to rows with adj_p_value populated."),
-            lnfc_threshold: Optional[float] = Field(None, description="Optional minimum |lnfc| magnitude. Only applied to rows with lnfc populated (ANCOM-BC). DESeq2 rows are not filtered by this parameter. Leave unset (None) to skip lnfc filtering entirely.")
-        ) -> list[types.TextContent]:
+            lnfc_threshold: Optional[float] = Field(None, description="Optional minimum |lnfc| magnitude. Only applied to rows with lnfc populated (ANCOM-BC). DESeq2 rows are not filtered by this parameter. Leave unset (None) to skip lnfc filtering entirely."),
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
             """USE THIS TOOL (not the `query` tool) for any "common
             differentially abundant organisms across assays", "organisms
             increased in BOTH assays", "shared abundance signals across
@@ -3201,6 +3821,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             3. Inner joins among increased and among decreased abundance organisms
             4. Returns markdown tables showing common organisms and their log2fc values
             """
+            try:
+                _resolve_session(session_id, "find_common_differentially_abundant_organisms")
+            except SessionError as e:
+                return _session_error_content(e)
+
 
             if len(assay_ids) < 2:
                 return [types.TextContent(type="text", text="Error: Please provide at least 2 assay IDs.")]
@@ -3346,7 +3971,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 for i, aid in enumerate(assay_ids):
                     md += f"- **Assay {i+1}:** {aid}\n"
 
-                return [types.TextContent(type="text", text=md, mimeType="text/markdown")]
+                return [types.TextContent(type="text", text=md)]
 
             except Exception as e:
                 logger.error(f"Error finding common differentially abundant organisms: {e}")
@@ -3410,7 +4035,8 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     "methylated-gene set. None (default) imposes no distance filter."
                 ),
             ),
-        ) -> list[types.TextContent]:
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
             """USE THIS TOOL (not the `query` tool) for any
             "expression-methylation coupling", "classical epigenetic
             silencing", "DE genes that are also DM", "downregulated genes
@@ -3446,6 +4072,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             comparison), pass them as a list to capture the combined methylation
             evidence on the methylation side of the intersection.
             """
+            try:
+                _resolve_session(session_id, "find_common_de_genes_overlapping_dm_regions")
+            except SessionError as e:
+                return _session_error_content(e)
+
 
             # Normalize methylation_assay_id to a list so pooled and single
             # paths share one implementation.
@@ -3637,7 +4268,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     else:
                         md += table_md + "\n\n"
 
-                return [types.TextContent(type="text", text=md, mimeType="text/markdown")]
+                return [types.TextContent(type="text", text=md)]
 
             except Exception as e:
                 logger.error(f"Error finding DE/DM overlap: {e}")
@@ -3662,7 +4293,8 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         figsize_width: int = Field(8, description="Figure width in inches"),
         figsize_height: int = Field(5, description="Figure height in inches"),
         label_avoid_overlap: bool = Field(True, description="If True, use adjustText to reposition labels to avoid overlap. Disable on very large assays for faster rendering."),
-    ) -> list[types.Content]:
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.ContentBlock]:
         """Create a volcano plot for differential data from the given assay.
 
         Works for three differential measurement types:
@@ -3688,6 +4320,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         saved file path. Designed to handle assays with thousands of features without
         timing out.
         """
+        try:
+            _resolve_session(session_id, "create_volcano_plot")
+        except SessionError as e:
+            return _session_error_content(e)
+
 
         valid_types = ("expression", "methylation", "abundance")
         if data_type not in valid_types:
@@ -3945,10 +4582,10 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                     stem, extension="png"
                 )
                 # Only write the PNG to the server's filesystem in stdio/local
-                # mode where the user can actually reach it. In AgentCore /
+                # mode where the user can actually reach it. In Fargate /
                 # remote deployments the inline ImageContent + on-demand
                 # get_save_script is the user's reachable copy; writing to
-                # /tmp inside the microVM is dead I/O that leaks across
+                # /tmp inside the shared container is dead I/O that leaks across
                 # stateful sessions.
                 if not _is_remote_deployment():
                     try:
@@ -3989,17 +4626,17 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             )
             summary += f"\n**File saved to:** `{user_facing_path}`\n"
 
-            result_items: list[types.Content] = [
-                types.TextContent(type="text", text=summary, mimeType="text/markdown"),
+            result_items: list[types.ContentBlock] = [
+                types.TextContent(type="text", text=summary),
             ]
 
-            # Inline base64 image for direct display in the chat. AgentCore
-            # Runtime allows 100 MB payloads; we cap at 50 MB defensively to
+            # Inline base64 image for direct display in the chat. We cap at
+            # 50 MB defensively (well under any transport/ALB limit) to
             # leave headroom for clients with stricter size limits.
             if len(png_bytes) < 50_000_000:
                 img_b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
                 result_items.append(
-                    types.ImageContent(type="image", data=img_b64, mimeType="image/png")
+                    types.ImageContent(type="image", data=img_b64, mime_type="image/png")
                 )
             else:
                 logger.warning(
@@ -4041,7 +4678,6 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                 types.TextContent(
                     type="text",
                     text=_make_save_hint(user_facing_path, suggested_filename, len(png_bytes)),
-                    mimeType="text/markdown",
                 )
             )
 
@@ -4075,8 +4711,9 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         in_intron: Optional[bool] = Field(None, description="MethylationRegion location filter (data_type='methylation' or 'expression_methylation' only). When True, only include methylation regions overlapping an intron. When False, exclude intron-overlapping regions. None (default) imposes no intron filter. Maps directly to the in_intron property on MethylationRegion nodes."),
         dist_to_feature_max: Optional[int] = Field(None, description="MethylationRegion distance filter (data_type='methylation' or 'expression_methylation' only). When set, only include methylation regions whose dist_to_feature (distance in bp to the nearest gene feature) is <= this value. Useful for restricting to regions close to gene bodies. None (default) imposes no distance filter."),
         figsize_width: int = Field(10, description="Figure width in inches"),
-        figsize_height: int = Field(6, description="Figure height in inches")
-    ) -> list[types.Content]:
+        figsize_height: int = Field(6, description="Figure height in inches"),
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.ContentBlock]:
         """Create Venn diagrams comparing differential data between 2 or 3 assays.
         
         Supports multiple data types:
@@ -4129,6 +4766,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
         Returns a link to the plot and summary statistics.
         """
+        try:
+            _resolve_session(session_id, "create_venn_diagram")
+        except SessionError as e:
+            return _session_error_content(e)
+
         
         valid_types = ("expression", "methylation", "abundance", "expression_methylation")
         if data_type not in valid_types:
@@ -4679,7 +5321,7 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 
             if venn_png_bytes is not None and not _is_remote_deployment():
                 # Only write to the server's filesystem in stdio/local mode
-                # where the user can actually reach the file. In AgentCore /
+                # where the user can actually reach the file. In Fargate /
                 # remote deployments the inline ImageContent + on-demand
                 # get_save_script is the user's reachable copy.
                 try:
@@ -4852,18 +5494,18 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
 """
             
             # --- Build return ---
-            venn_result_items: list[types.Content] = [
-                types.TextContent(type="text", text=summary, mimeType="text/markdown"),
+            venn_result_items: list[types.ContentBlock] = [
+                types.TextContent(type="text", text=summary),
             ]
 
             # Inline base64 image from the in-memory bytes captured during save.
-            # AgentCore Runtime supports 100 MB payloads; defensive 50 MB cap
+            # Defensive 50 MB cap on the inline payload
             # protects against pathological cases on smaller-capacity clients.
             if venn_png_bytes is not None:
                 if len(venn_png_bytes) < 50_000_000:
                     img_b64 = base64.standard_b64encode(venn_png_bytes).decode("utf-8")
                     venn_result_items.append(
-                        types.ImageContent(type="image", data=img_b64, mimeType="image/png")
+                        types.ImageContent(type="image", data=img_b64, mime_type="image/png")
                     )
                 else:
                     logger.warning(
@@ -4888,7 +5530,6 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
                             venn_suggested_filename,
                             len(venn_png_bytes),
                         ),
-                        mimeType="text/markdown",
                     )
                 )
 
@@ -4909,7 +5550,9 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             "openWorldHint": False,
         },
     )
-    def clean_mermaid_diagram(mermaid_content: str) -> list[types.TextContent]:
+    def clean_mermaid_diagram(mermaid_content: str,
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
         """Clean a Mermaid class diagram by removing unwanted elements.
         
         This tool removes:
@@ -4923,6 +5566,11 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
         Returns:
             Cleaned Mermaid content with note statements, empty braces, and post-newline strings removed
         """
+        try:
+            _resolve_session(session_id, "clean_mermaid_diagram")
+        except SessionError as e:
+            return _session_error_content(e)
+
         # First, truncate any strings after \n characters in the entire content
         # This handles cases like "MEASURED_DIFFERENTIAL_METHYLATION_ASmMR\nmethylation_diff, q_value"
         mermaid_content = re.sub(r'(\S+)\\n[^\s\n]*', r'\1', mermaid_content)
@@ -4998,8 +5646,15 @@ RETURN label, apoc.map.fromPairs(attributes) as attributes, apoc.map.fromPairs(r
             "openWorldHint": False,
         },
     )
-    async def create_chat_transcript() -> list[types.TextContent]:
+    async def create_chat_transcript(
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
         """Prompt for creating a chat transcript in markdown format with user prompts and Claude responses."""
+        try:
+            _resolve_session(session_id, "create_chat_transcript")
+        except SessionError as e:
+            return _session_error_content(e)
+
         today = datetime.now().strftime("%Y-%m-%d")
     
         prompt = f"""Create a chat transcript in .md format following the outline below. 
@@ -5046,8 +5701,15 @@ IMPORTANT:
             "openWorldHint": False,
         },
     )
-    async def visualize_schema() -> list[types.TextContent]:
+    async def visualize_schema(
+        session_id: Optional[str] = _session_id_field(),
+    ) -> list[types.TextContent]:
         """Prompt for visualizing the knowledge graph schema using a Mermaid class diagram."""
+        try:
+            _resolve_session(session_id, "visualize_schema")
+        except SessionError as e:
+            return _session_error_content(e)
+
         prompt = """Visualize the knowledge graph schema using a Mermaid class diagram. 
 
 CRITICAL WORKFLOW - Follow these steps EXACTLY IN ORDER:
@@ -5129,8 +5791,8 @@ def _require_env(name: str) -> str:
         raise SystemExit(
             f"FATAL: {name} is not set. On a remote/public deployment "
             f"(MCP_TRANSPORT=streamable-http|http|sse) Neo4j credentials must be "
-            f"injected at runtime (e.g. AWS Secrets Manager via the AgentCore/ECS "
-            f"task definition). Refusing to start with a built-in default."
+            f"injected at runtime (e.g. AWS Secrets Manager via the ECS task "
+            f"definition `secrets` block). Refusing to start with a built-in default."
         )
     return val
 
@@ -5139,7 +5801,7 @@ async def async_main() -> None:
     transport = os.getenv("MCP_TRANSPORT", "stdio")
 
     # Credential policy is deployment-aware:
-    #   - Remote (streamable-http/http/sse, i.e. AgentCore Runtime / ECS): NO
+    #   - Remote (streamable-http/http/sse, i.e. ECS Fargate): NO
     #     insecure defaults. Every credential MUST be injected at runtime or the
     #     server refuses to start. This prevents shipping a public endpoint that
     #     is reachable with a known built-in password.
@@ -5169,6 +5831,16 @@ async def async_main() -> None:
         "gene expression (RNA-Seq), DNA methylation (WGBS/methylKit), and microbial "
         "abundance (DESeq2/ANCOM-BC).\n"
         "\n"
+        "SESSION PROTOCOL (must be followed):\n"
+        "- This server serves many users from one shared process. Before calling any\n"
+        "  other tool, call `create_session` ONCE and keep the returned session_id.\n"
+        "- Pass that session_id as the `session_id` argument on EVERY tool call. It\n"
+        "  is what keeps your output directory and generated plots private to you.\n"
+        "- If a tool replies that the session is missing, unknown or expired, call\n"
+        "  `create_session` again, use the NEW id from then on, and regenerate any\n"
+        "  plots you still need. Never invent or reuse a session_id from elsewhere.\n"
+        "- Plot resources are addressed as plot://<session_id>/<filename>.\n"
+        "\n"
         "TOOL SELECTION POLICY (must be followed):\n"
         "- For 'up/down-regulated genes', 'DEGs', 'differential expression', or any\n"
         "  per-assay log2fc question: ALWAYS call find_differentially_expressed_genes;\n"
@@ -5181,6 +5853,9 @@ async def async_main() -> None:
         "  ALWAYS call find_differentially_abundant_organisms; NEVER call `query`.\n"
         "- For study metadata, factor space, or 'what assays does study X have':\n"
         "  ALWAYS call get_study_info or select_assays; NEVER call `query`.\n"
+        "- For 'what groups / conditions / control vs experimental groups are in\n"
+        "  study X' or 'what was compared': ALWAYS call select_assays(study_id=...)\n"
+        "  (list mode) — its factor menu is the list of groups; NEVER call `query`.\n"
         "- For comparing DEGs/DMRs/DA organisms across multiple assays: use the\n"
         "  matching find_common_* tool, NEVER the `query` tool.\n"
         "- For DE genes overlapping DM regions (expression-methylation coupling):\n"
@@ -5200,11 +5875,27 @@ async def async_main() -> None:
     # (auth is passed separately) but we still avoid logging username/password.
     logger.info(f"Neo4j database: {database} (pool_size={NEO4J_POOL_SIZE})")
     logger.info("All Neo4j sessions use READ_ACCESS mode (write operations are blocked)")
+    logger.info(
+        f"Session policy: {SESSION_POLICY} "
+        f"(idle_ttl={int(_sessions.SESSION_IDLE_TTL_SECONDS)}s, "
+        f"max_age={int(_sessions.SESSION_MAX_AGE_SECONDS)}s, "
+        f"max_sessions={_sessions.MAX_SESSIONS}, "
+        f"plots/session={_sessions.MAX_PLOTS_PER_SESSION}); "
+        f"usage_log={_metrics.USAGE_LOG_ENABLED} emf={_metrics.EMF_ENABLED} "
+        f"metrics_endpoint={_metrics.METRICS_ENDPOINT_ENABLED}"
+    )
+    if _remote:
+        logger.info(
+            f"HTTP routes: POST /mcp (MCP), GET /healthz (liveness), "
+            f"GET /readyz (readiness; Neo4j RETURN 1, timeout {READYZ_TIMEOUT_SECONDS}s)"
+            + (", GET /metrics" if _metrics.METRICS_ENDPOINT_ENABLED else "")
+        )
 
-    # Bound the connection pool and acquisition timeout. On AgentCore each
-    # microVM has its own pool against the shared Neo4j instance, so keep the
-    # per-process pool modest (see NEO4J_POOL_SIZE). The acquisition timeout
-    # ensures a saturated pool fails fast with a clear error instead of hanging.
+    # Bound the connection pool and acquisition timeout. Each ECS task runs one
+    # process with one pool against the shared Neo4j instance, so keep the
+    # per-task pool modest (see NEO4J_POOL_SIZE) and size pool × tasks against
+    # Neo4j's connection ceiling. The acquisition timeout ensures a saturated
+    # pool fails fast with a clear error instead of hanging.
     neo4j_driver = AsyncGraphDatabase.driver(
         db_url,
         auth=(username, password),
@@ -5212,15 +5903,23 @@ async def async_main() -> None:
         connection_acquisition_timeout=NEO4J_ACQUISITION_TIMEOUT,
     )
 
-    mcp = create_mcp_server(neo4j_driver, database, instructions, host=host, port=port)
+    mcp = create_mcp_server(neo4j_driver, database, instructions)
 
     match transport:
         case "stdio":
             await mcp.run_stdio_async()
         case "sse":
-            await mcp.run_sse_async()
+            await mcp.run_sse_async(host=host, port=port)
         case "streamable-http" | "http":
-            await mcp.run_streamable_http_async()
+            # stateless_http=True: every POST /mcp is self-contained, so any
+            # Fargate task behind the ALB can serve any request and no
+            # MCP-level session is pinned to a process. Per-user state is
+            # handled at the APPLICATION level via the session_id tool
+            # parameter — NOT via the transport's Mcp-Session-Id, which
+            # stateless mode does not issue. With host=0.0.0.0 the SDK leaves
+            # DNS-rebinding protection off, so the public Host header
+            # forwarded by CloudFront/ALB is accepted.
+            await mcp.run_streamable_http_async(host=host, port=port, **STREAMABLE_HTTP_OPTIONS)
         case _:
             raise ValueError(f"Invalid transport: {transport} | Must be 'stdio', 'sse', 'streamable-http', or 'http'")
 

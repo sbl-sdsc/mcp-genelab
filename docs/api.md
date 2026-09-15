@@ -1,11 +1,25 @@
 ## API Reference
 
-The mcp-genelab server exposes **22 tools** plus a `plot://{filename}` resource template. The tools are grouped below by category, matching the groupings in the project README. Specialist tools should be preferred over the generic `query` tool — `server.py`'s `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
+The mcp-genelab server exposes **24 tools** (22 analysis/utility tools plus the `create_session` / `end_session` lifecycle pair) and a `plot://{session_id}/{filename}` resource template. The tools are grouped below by category, matching the groupings in the project README. Specialist tools should be preferred over the generic `query` tool — `server.py`'s `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
 
 All Neo4j sessions are opened in read-only mode (`READ_ACCESS`), so no tool can modify the knowledge graph.
 
+### Sessions (public endpoint)
+
+The hosted server runs as one shared process serving many users (ECS Fargate behind an ALB), so all per-user state — the output directory and the plot registry — is keyed on an application-level **session id**:
+
+1. Call **`create_session`** once at the start of a conversation. It returns `session_id: <token>`.
+2. Pass that token as the **`session_id` argument on every other tool call**. On the public endpoint (`MCP_SESSION_POLICY=strict`, the default for remote transports) every tool except `create_session` rejects calls without a valid `session_id` with an `Error (missing session)` block.
+3. If a tool replies `Error (unknown session)` or `Error (expired session)`, call `create_session` again and use the new id (plots from the old session must be regenerated). Sessions expire after 60 minutes idle or 8 hours total (configurable).
+4. Optionally call **`end_session`** when done.
+
+The `session_id` parameter is documented once here rather than repeated under every tool below: `session_id` (string). On the public endpoint (`strict` policy) the tool schemas mark it **required**, so clients pass it automatically; when the server runs locally over stdio (one user, one process) it is optional and a fixed local session is used.
+
 ### Table of Contents
 
+- [Sessions](#sessions)
+  - [`create_session`](#create_session)
+  - [`end_session`](#end_session)
 - [Schema & metadata](#schema--metadata)
   - [`get_neo4j_schema`](#get_neo4j_schema)
   - [`get_node_metadata`](#get_node_metadata)
@@ -30,13 +44,37 @@ All Neo4j sessions are opened in read-only mode (`READ_ACCESS`), so no tool can 
   - [`create_venn_diagram`](#create_venn_diagram)
   - [`fetch_plot`](#fetch_plot)
   - [`get_save_script`](#get_save_script)
-  - [`plot://{filename}` (resource)](#plotfilename-resource)
+  - [`plot://{session_id}/{filename}` (resource)](#plotsession_idfilename-resource)
 - [Output paths](#output-paths)
   - [`set_output_directory`](#set_output_directory)
   - [`get_output_directory`](#get_output_directory)
 - [Mermaid & transcript utilities](#mermaid--transcript-utilities)
   - [`clean_mermaid_diagram`](#clean_mermaid_diagram)
   - [`create_chat_transcript`](#create_chat_transcript)
+
+---
+
+## Sessions
+
+### `create_session`
+
+Starts a session and returns the `session_id` every other tool requires on the public endpoint. Call it once at the beginning of a conversation, and again whenever a tool reports the session as unknown or expired.
+
+**Parameters:**
+- None
+
+**Returns:**
+- `session_id: <token>` — an opaque, unguessable URL-safe token (treat it as private to the conversation), plus the session's idle/absolute lifetime
+
+### `end_session`
+
+Ends a session immediately, discarding its output-directory setting and all plots it holds. Optional — sessions also expire on their own.
+
+**Parameters:**
+- `session_id` (string, required)
+
+**Returns:**
+- A confirmation, or an error if the session is unknown/expired
 
 ---
 
@@ -310,7 +348,7 @@ Creates a volcano plot for differential expression, methylation, or abundance da
 - `label_avoid_overlap` (boolean, optional): If `True`, use adjustText to reposition labels to avoid overlap, default: True. Disable on very large assays for faster rendering.
 
 **Returns:**
-- The generated volcano plot PNG, returned inline as image content and registered in the plot registry (retrievable via `fetch_plot` or the `plot://` resource)
+- The generated volcano plot PNG, returned inline as image content and registered in the session's plot registry (retrievable via `fetch_plot` or the `plot://{session_id}/{filename}` resource)
 - A Markdown-formatted summary with:
   - Study information
   - Factor comparison details
@@ -350,7 +388,7 @@ Creates Venn diagrams comparing differentially expressed genes (or DMRs, or DA o
 - `figsize_height` (integer, optional): Figure height in inches, default: 6
 
 **Returns:**
-- The generated Venn diagram PNG, returned inline as image content and registered in the plot registry (retrievable via `fetch_plot` or the `plot://` resource)
+- The generated Venn diagram PNG, returned inline as image content and registered in the session's plot registry (retrievable via `fetch_plot` or the `plot://{session_id}/{filename}` resource)
 - A Markdown-formatted summary with:
   - Study information
   - Assay comparisons (factor combinations)
@@ -368,36 +406,39 @@ Creates Venn diagrams comparing differentially expressed genes (or DMRs, or DA o
 
 ### `fetch_plot`
 
-Re-fetches the canonical PNG bytes of a previously generated plot from the in-memory registry. Safe to call repeatedly — it performs no Cypher, no matplotlib, and no re-render — so a failed fetch can be retried without re-running the analysis.
+Re-fetches the canonical PNG bytes of a plot previously generated **in the same session** from the in-memory registry. Safe to call repeatedly — it performs no Cypher, no matplotlib, and no re-render — so a failed fetch can be retried without re-running the analysis.
 
 **Parameters:**
-- `filename` (string, required): Suggested filename of a previously generated plot (e.g., 'venn_expression_2way_OSD-244.png'). The filename appears in the "Save" block of the most recent `create_volcano_plot` or `create_venn_diagram` response. The server keeps the last 8 plots in memory (FIFO eviction).
+- `filename` (string, required): Suggested filename of a previously generated plot (e.g., 'venn_expression_2way_OSD-244.png'). The filename appears in the "Save" block of the most recent `create_volcano_plot` or `create_venn_diagram` response. Each session keeps its last 8 plots in memory (FIFO eviction).
+- `session_id` (string): the session that generated the plot
 
 **Returns:**
-- The plot's PNG bytes as embedded image content, so clients can render it inline
-- An error message if the requested filename is not in the registry
+- The plot's PNG bytes as an `EmbeddedResource` (URI `plot://<session_id>/<filename>`), so clients can render it inline
+- An error message if the requested filename is not in this session's registry (plots from other sessions are not addressable)
 
 ### `get_save_script`
 
 Returns guidance for saving a previously generated plot to the user's machine. With no filename, lists the plots currently in the registry; with a filename, returns the detailed save options for that plot.
 
 **Parameters:**
-- `filename` (string or null, optional): Suggested filename of a recently generated plot (e.g., 'volcano_plot_OSD-244_expression_30_days_vs_60_days.png'). The filename appears in the "Save" block of the most recent `create_volcano_plot` or `create_venn_diagram` response. Omit this parameter (`null`) to list the filenames of all plots currently available in the registry.
+- `filename` (string or null, optional): Suggested filename of a recently generated plot (e.g., 'volcano_plot_OSD-244_expression_30_days_vs_60_days.png'). The filename appears in the "Save" block of the most recent `create_volcano_plot` or `create_venn_diagram` response. Omit this parameter (`null`) to list the filenames of all plots currently available in this session's registry.
+- `session_id` (string): the session that generated the plot
 
 **Returns:**
-- A markdown block with multiple save options for the plot: right-click save, ask the LLM client to save it, or fetch it via the `plot://` resource URI
+- A markdown block with multiple save options for the plot: right-click save, ask the LLM client to save it, or fetch it via the `plot://<session_id>/<filename>` resource URI
 - When `filename` is omitted, a list of all currently registered plot filenames; when a filename is not found, a message indicating it is not in the registry
 
-### `plot://{filename}` (resource)
+### `plot://{session_id}/{filename}` (resource)
 
-MCP resource template for retrieving the PNG bytes of a generated plot. Decoupled from the tool response that produced the plot, so a failed fetch can be retried without re-running the analysis.
+MCP resource template for retrieving the PNG bytes of a generated plot. Decoupled from the tool response that produced the plot, so a failed fetch can be retried without re-running the analysis. The session id is part of the URI because `resources/read` carries no other argument — it is what makes one session's plot unaddressable from another on the shared endpoint.
 
 **Type:** MCP resource (read via `resources/read`)
 
-**URI:** `plot://<suggested_filename>` (e.g., `plot://venn_expression_2way_OSD-244.png`)
+**URI:** `plot://<session_id>/<suggested_filename>` (e.g., `plot://Zq3…Xw/venn_expression_2way_OSD-244.png`). Every save hint, `fetch_plot` result and `get_save_script` block emits the exact URI to use.
 
 **Returns:**
-- The raw PNG bytes for the named plot from the in-memory registry (last 8 plots)
+- The raw PNG bytes for the named plot from that session's in-memory registry (last 8 plots per session)
+- An error for an unknown/expired session or a filename not in that session's registry
 
 ---
 
@@ -405,10 +446,11 @@ MCP resource template for retrieving the PNG bytes of a generated plot. Decouple
 
 ### `set_output_directory`
 
-Sets the user-facing directory where output files (volcano plots, Venn diagrams, CSV exports) should be saved for this session.
+Sets the user-facing directory where output files (volcano plots, Venn diagrams, CSV exports) should be saved for this session. The value is stored in the session's state only — other sessions cannot see or change it.
 
 **Parameters:**
 - `path` (string, required): Absolute path on the USER's local machine where output files should be saved. Examples: '/Users/jane/Downloads', '/home/jane/Downloads', 'C:/Users/Jane/Downloads' (forward slashes work on Windows too with pathlib). Avoid trailing path separators.
+- `session_id` (string)
 
 **Returns:**
 - A confirmation message echoing the directory that was set, or an error message if the path is empty/invalid
@@ -418,7 +460,7 @@ Sets the user-facing directory where output files (volcano plots, Venn diagrams,
 Returns the currently configured output directory for this session.
 
 **Parameters:**
-- None
+- `session_id` (string)
 
 **Returns:**
 - The path previously set by `set_output_directory`, or a note indicating that no output directory has been configured (pointing the user to `set_output_directory`)
