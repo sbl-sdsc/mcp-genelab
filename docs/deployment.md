@@ -84,10 +84,12 @@ avoid the NAT gateway's hourly cost when that is the only egress the task needs.
 | `MCP_NEO4J_POOL_SIZE` | no | `20` | Per-**task** connection pool |
 | `MCP_NEO4J_ACQUISITION_TIMEOUT` | no | `30` | Fail-fast on pool saturation |
 | `MCP_READYZ_TIMEOUT_SECONDS` | no | `4` | Budget for the `/readyz` Neo4j ping (keep < ALB health-check timeout) |
+| `MCP_MAX_REQUEST_BODY_BYTES` | no | `1048576` | Maximum size of one `POST /mcp` body (1 MiB); second cap behind the WAF body-size rule |
 | `MCP_SESSION_POLICY` | no | `strict` (remote) / `implicit` (stdio) | `strict`: every tool except `create_session` requires a valid `session_id`. `lenient`: only state-bearing tools require it. `implicit`: fixed local session (stdio only). |
 | `MCP_SESSION_IDLE_TTL_SECONDS` | no | `3600` | Session dropped after this long without a call |
 | `MCP_SESSION_MAX_AGE_SECONDS` | no | `28800` | Absolute session lifetime (8 h) |
-| `MCP_MAX_SESSIONS` | no | `10000` | Live-session cap per task. At the cap only sessions idle ≥ `MCP_SESSION_EVICTION_MIN_IDLE_SECONDS` (default `300`) are recycled (LRU first); otherwise `create_session` is refused — a flood cannot log active users out |
+| `MCP_MAX_SESSIONS` | no | `10000` | Live-session cap per task. At the cap only sessions idle ≥ `MCP_SESSION_EVICTION_MIN_IDLE_SECONDS` are recycled (LRU first); otherwise `create_session` is refused — a flood cannot log active users out |
+| `MCP_SESSION_EVICTION_MIN_IDLE_SECONDS` | no | `300` | Minimum idle time before a session may be recycled to make room at the `MCP_MAX_SESSIONS` cap |
 | `MCP_READYZ_CACHE_SECONDS` | no | `2` | Reuse the last `/readyz` verdict for this long (probe bursts can't amplify into Neo4j load) |
 | `MCP_MAX_PLOTS_PER_SESSION` | no | `8` | Plots retained per session (FIFO) |
 | `MCP_MAX_TOTAL_PLOT_BYTES` | no | `268435456` | Process-wide cap on retained PNG bytes (256 MiB) |
@@ -95,6 +97,7 @@ avoid the NAT gateway's hourly cost when that is the only egress the task needs.
 | `MCP_USAGE_FP_SALT` | recommended | random per process | Salt for the `client_fp` usage-log field (viewer IP + User-Agent → digest). Inject from Secrets Manager so fingerprints are comparable across task restarts |
 | `MCP_METRICS_EMF` | no | `0` | Also emit CloudWatch Embedded Metric Format documents |
 | `MCP_METRICS_NAMESPACE` | no | `mcp-genelab` | CloudWatch namespace for EMF metrics |
+| `MCP_SERVICE_NAME` | no | `mcp-genelab` | `service` field on every usage-log event and the `Service` EMF dimension |
 | `MCP_METRICS_ENDPOINT` | no | `0` | Expose `GET /metrics` (Prometheus text / JSON) |
 | `MCP_LOG_LEVEL` | no | `INFO` | `DEBUG` logs full queries (avoid in prod) |
 | `INSTRUCTIONS` | no | built-in policy | Session protocol + tool-selection policy; leave unset |
@@ -171,7 +174,9 @@ Notes:
   `AWSManagedRulesAmazonIpReputationList` at lower priority.
 - Cap the request body size (a `SizeConstraintStatement` on `Body`, e.g.
   64 KB) so a giant Cypher string can't be posted. The server's own transport
-  also enforces `max_request_body_size` (SDK default 4 MB).
+  enforces a second cap, `MCP_MAX_REQUEST_BODY_BYTES` (default 1 MiB, passed
+  to the SDK as `max_request_body_size` in `STREAMABLE_HTTP_OPTIONS`); a POST
+  larger than that is rejected by the container even if it passes the WAF.
 - Restrict CloudFront → ALB with a custom origin header the ALB listener rule
   requires (or the CloudFront prefix-list on the ALB security group), so the
   WAF cannot be bypassed by hitting the ALB directly.
