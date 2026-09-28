@@ -74,6 +74,10 @@ ENV NEO4J_DATABASE="spoke-genelab-v0.3.1"
 ENV MCP_TRANSPORT="streamable-http"
 ENV MCP_HOST="0.0.0.0"
 ENV MCP_PORT="8000"
+# Public path prefix when the ALB / CloudFront publish the service under one,
+# e.g. MCP_PATH_PREFIX="/kg" → POST /kg/mcp, GET /kg/healthz, /kg/readyz,
+# /kg/metrics (ALB cannot rewrite paths). Empty = routes at the root.
+ENV MCP_PATH_PREFIX=""
 # Operational bounds (safe defaults; override per deployment). See
 # docs/deployment.md §3 for tuning guidance under the shared-process model
 # (pool_size × number_of_tasks vs. Neo4j's connection ceiling).
@@ -106,7 +110,7 @@ EXPOSE 8000
 # copy the same command into the task definition's container `healthCheck`
 # (docs/deployment.md §6). Uses the stdlib so the image needs no curl.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
+  CMD ["python", "-c", "import os,urllib.request,sys; p='/'+os.environ.get('MCP_PATH_PREFIX','').strip('/'); p='' if p=='/' else p; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000'+p+'/healthz', timeout=3).status == 200 else 1)"]
 
 # Run the MCP server
 CMD ["mcp-genelab"]

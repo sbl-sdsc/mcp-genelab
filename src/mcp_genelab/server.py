@@ -92,6 +92,23 @@ READYZ_TIMEOUT_SECONDS: float = float(os.getenv("MCP_READYZ_TIMEOUT_SECONDS", "4
 # into Neo4j load (0 disables the cache).
 READYZ_CACHE_SECONDS: float = float(os.getenv("MCP_READYZ_CACHE_SECONDS", "2"))
 
+# Public path prefix. An ALB (or CloudFront) forwards the request path
+# untouched and cannot rewrite it, so when the service is published under a
+# prefix — e.g. https://host/kg/mcp — the app must serve its routes under that
+# same prefix. MCP_PATH_PREFIX="/kg" moves EVERY route: POST /kg/mcp,
+# GET /kg/healthz, /kg/readyz, /kg/metrics. Empty (default) keeps them at root.
+def _normalize_prefix(raw: Optional[str]) -> str:
+    """'/kg', 'kg/', '/kg/' → '/kg'; '', '/', None → ''."""
+    p = (raw or "").strip().strip("/")
+    return f"/{p}" if p else ""
+
+
+PATH_PREFIX: str = _normalize_prefix(os.getenv("MCP_PATH_PREFIX"))
+MCP_PATH: str = f"{PATH_PREFIX}/mcp"
+HEALTHZ_PATH: str = f"{PATH_PREFIX}/healthz"
+READYZ_PATH: str = f"{PATH_PREFIX}/readyz"
+METRICS_PATH: str = f"{PATH_PREFIX}/metrics"
+
 # Streamable-HTTP transport options for the public endpoint (mcp 2.x passes
 # these to run_streamable_http_async / streamable_http_app, not the server
 # constructor). Kept in one place so the test harness builds the SAME app the
@@ -101,6 +118,7 @@ STREAMABLE_HTTP_OPTIONS: dict[str, Any] = {
     "stateless_http": True,
     "json_response": False,  # SSE-framed responses: the widest client compatibility
     "max_request_body_size": int(os.getenv("MCP_MAX_REQUEST_BODY_BYTES", str(1024 * 1024))),
+    "streamable_http_path": MCP_PATH,  # honours MCP_PATH_PREFIX (see above)
 }
 NEO4J_ACQUISITION_TIMEOUT: float = float(
     os.getenv("MCP_NEO4J_ACQUISITION_TIMEOUT", "30")
@@ -813,7 +831,9 @@ def _install_http_routes(mcp: MCPServer, neo4j_driver: AsyncDriver, database: st
 
     The MCP endpoint (`/mcp`) is POST-only and cannot answer an ALB health
     check (ALB health checks are always HTTP GET; default success matcher
-    200). Two routes are added to the Starlette app MCPServer builds:
+    200). Two routes are added to the Starlette app MCPServer builds (all
+    paths below are relative to MCP_PATH_PREFIX, e.g. `/kg/healthz` when the
+    service is published as `https://host/kg/mcp`):
 
       GET /healthz  — liveness. No I/O; 200 as long as the process can serve
                       a request. Use for the ECS container healthCheck.
@@ -832,7 +852,7 @@ def _install_http_routes(mcp: MCPServer, neo4j_driver: AsyncDriver, database: st
     from starlette.requests import Request
     from starlette.responses import JSONResponse, PlainTextResponse, Response
 
-    @mcp.custom_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
+    @mcp.custom_route(HEALTHZ_PATH, methods=["GET", "HEAD"], include_in_schema=False)
     async def healthz(request: Request) -> Response:
         return JSONResponse({"status": "ok", "service": "mcp-genelab", "version": __version__})
 
@@ -842,7 +862,7 @@ def _install_http_routes(mcp: MCPServer, neo4j_driver: AsyncDriver, database: st
     # 30 s interval is far coarser than that.
     _readyz_cache: dict[str, Any] = {"ts": 0.0, "body": None, "code": 503}
 
-    @mcp.custom_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
+    @mcp.custom_route(READYZ_PATH, methods=["GET", "HEAD"], include_in_schema=False)
     async def readyz(request: Request) -> Response:
         now = time.monotonic()
         if _readyz_cache["body"] is not None and (now - _readyz_cache["ts"]) < READYZ_CACHE_SECONDS:
@@ -862,7 +882,7 @@ def _install_http_routes(mcp: MCPServer, neo4j_driver: AsyncDriver, database: st
         return JSONResponse(body, status_code=code, headers={"Cache-Control": "no-store"})
 
     if _metrics.METRICS_ENDPOINT_ENABLED:
-        @mcp.custom_route("/metrics", methods=["GET"], include_in_schema=False)
+        @mcp.custom_route(METRICS_PATH, methods=["GET"], include_in_schema=False)
         async def metrics_route(request: Request) -> Response:
             stats = SESSION_STORE.stats()
             if "application/json" in (request.headers.get("accept") or ""):
@@ -5886,9 +5906,10 @@ async def async_main() -> None:
     )
     if _remote:
         logger.info(
-            f"HTTP routes: POST /mcp (MCP), GET /healthz (liveness), "
-            f"GET /readyz (readiness; Neo4j RETURN 1, timeout {READYZ_TIMEOUT_SECONDS}s)"
-            + (", GET /metrics" if _metrics.METRICS_ENDPOINT_ENABLED else "")
+            f"HTTP routes (MCP_PATH_PREFIX={PATH_PREFIX or '<none>'}): POST {MCP_PATH} (MCP), "
+            f"GET {HEALTHZ_PATH} (liveness), "
+            f"GET {READYZ_PATH} (readiness; Neo4j RETURN 1, timeout {READYZ_TIMEOUT_SECONDS}s)"
+            + (f", GET {METRICS_PATH}" if _metrics.METRICS_ENDPOINT_ENABLED else "")
         )
 
     # Bound the connection pool and acquisition timeout. Each ECS task runs one

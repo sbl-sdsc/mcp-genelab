@@ -85,6 +85,7 @@ avoid the NAT gateway's hourly cost when that is the only egress the task needs.
 | `MCP_NEO4J_ACQUISITION_TIMEOUT` | no | `30` | Fail-fast on pool saturation |
 | `MCP_READYZ_TIMEOUT_SECONDS` | no | `4` | Budget for the `/readyz` Neo4j ping (keep < ALB health-check timeout) |
 | `MCP_MAX_REQUEST_BODY_BYTES` | no | `1048576` | Maximum size of one `POST /mcp` body (1 MiB); second cap behind the WAF body-size rule |
+| `MCP_PATH_PREFIX` | no | *(empty)* | Public path prefix when the ALB/CloudFront publish the service under one (they cannot rewrite paths). `/kg` → `POST /kg/mcp`, `GET /kg/healthz`, `/kg/readyz`, `/kg/metrics`. Must match the listener-rule path pattern (`/kg/*`) and the health-check paths below |
 | `MCP_SESSION_POLICY` | no | `strict` (remote) / `implicit` (stdio) | `strict`: every tool except `create_session` requires a valid `session_id`. `lenient`: only state-bearing tools require it. `implicit`: fixed local session (stdio only). |
 | `MCP_SESSION_IDLE_TTL_SECONDS` | no | `3600` | Session dropped after this long without a call |
 | `MCP_SESSION_MAX_AGE_SECONDS` | no | `28800` | Absolute session lifetime (8 h) |
@@ -279,6 +280,11 @@ GET routes on the same port:
 | `GET /healthz` | process is serving requests; **no** DB call | ECS container `healthCheck` (liveness) |
 | `GET /readyz` | Neo4j `RETURN 1` within `MCP_READYZ_TIMEOUT_SECONDS` (4 s); `503 {"status":"degraded"}` on failure | ALB target-group health check (readiness) |
 
+With `MCP_PATH_PREFIX` set, every route moves under the prefix — `/kg/healthz`,
+`/kg/readyz` (and `/kg/mcp`, `/kg/metrics`) for `MCP_PATH_PREFIX=/kg` — so the
+target-group `HealthCheckPath`, the container `healthCheck` command and the
+listener rule's path pattern (`/kg/*`) must all use the prefixed paths.
+
 Splitting the two matters: a Neo4j blip pulls the task from ALB rotation
 (readiness) without ECS killing and restarting a perfectly healthy container
 (liveness).
@@ -294,6 +300,8 @@ Target group:
   "Matcher": {"HttpCode": "200"}
 }
 ```
+
+(`"HealthCheckPath": "/kg/readyz"` when `MCP_PATH_PREFIX=/kg`.)
 
 Set `deregistration_delay.timeout_seconds` low (e.g. 30) — responses are
 short-lived; long-running Cypher is already capped at 60 s.
@@ -319,11 +327,12 @@ short-lived; long-running Cypher is already capped at 60 s.
       {"name": "MCP_SESSION_POLICY", "value": "strict"},
       {"name": "MCP_METRICS_EMF", "value": "1"},
       {"name": "NEO4J_URI", "value": "bolt://<private-neo4j-host>:7687"},
-      {"name": "NEO4J_DATABASE", "value": "spoke-genelab-v0.3.1"}
+      {"name": "NEO4J_DATABASE", "value": "neo4j"},
+      {"name": "MCP_PATH_PREFIX", "value": "/kg"}
     ],
     "secrets": [ "…see §1…" ],
     "healthCheck": {
-      "command": ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)\""],
+      "command": ["CMD-SHELL", "python -c \"import os,urllib.request,sys; p='/'+os.environ.get('MCP_PATH_PREFIX','').strip('/'); p='' if p=='/' else p; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000'+p+'/healthz', timeout=3).status == 200 else 1)\""],
       "interval": 30, "timeout": 5, "retries": 3, "startPeriod": 20
     },
     "logConfiguration": {
@@ -362,7 +371,7 @@ time to come up before failures count.
 - CloudFront origin request policy must **forward all headers** the MCP
   transport needs (`Accept`, `Content-Type`, `MCP-Protocol-Version`,
   `Authorization` if an OAuth route is added) and use a cache policy of
-  `CachingDisabled` for `/mcp*`; `/healthz` and `/readyz` should be reachable
+  `CachingDisabled` for `/mcp*` (or `/<prefix>/mcp*`); `/healthz` and `/readyz` should be reachable
   only from the ALB/VPC (listener rule: allow when the source is the health
   checker, else 403) so the public cannot probe them; `/readyz` additionally
   caches its verdict for `MCP_READYZ_CACHE_SECONDS` so a burst costs at most
@@ -425,10 +434,14 @@ which CloudWatch Logs converts into metrics automatically: `ToolCalls`,
 `ToolLatencyMs`; graph `SessionsCreated` per day for adoption.
 
 **Pull endpoint (`MCP_METRICS_ENDPOINT=1`, off by default).** `GET /metrics`
-returns Prometheus text (or JSON with `Accept: application/json`) of in-process
+(`GET /<prefix>/metrics` with `MCP_PATH_PREFIX`, e.g. `/kg/metrics`) returns
+Prometheus text (or JSON with `Accept: application/json`) of in-process
 counters plus session-store gauges (`live_sessions`, `retained_plot_bytes`, …).
 For a CloudWatch agent / ADOT sidecar scraping `localhost:8000`; if enabled,
-block `/metrics` at the ALB listener so it is not public.
+block `/metrics` at the ALB listener so it is not public. The push side —
+the JSON usage log on stderr and the EMF documents — is written to CloudWatch
+Logs by the `awslogs` driver and does not depend on any HTTP path, so the
+Logs Insights queries above are unaffected by `MCP_PATH_PREFIX`.
 
 **Application log.** Human-readable log on stderr. `MCP_LOG_LEVEL=INFO` in
 prod — `DEBUG` logs full Cypher. User queries are logged only in scrubbed,
@@ -478,7 +491,8 @@ the same Fargate service; the app is auth-agnostic. The session id (§5) is
 
 - [ ] Image is **ARM64** (`docker inspect <img> --format '{{.Architecture}}'` → `arm64`) and the task definition says `cpuArchitecture: ARM64`.
 - [ ] Container listens on `0.0.0.0:8000`; `POST /mcp`, `GET /healthz`, `GET /readyz` reachable from the ALB subnet.
-- [ ] ALB target group health check = `GET /readyz`, matcher `200`; ECS container healthCheck = `/healthz`.
+- [ ] If the public URL has a prefix (`https://host/kg/mcp`): `MCP_PATH_PREFIX=/kg` in the task definition; listener rule path pattern `/kg/*`; target-group health check `/kg/readyz`; container healthCheck resolves `/kg/healthz`.
+- [ ] ALB target group health check = `GET /readyz` (or `/<prefix>/readyz`), matcher `200`; ECS container healthCheck = `/healthz` (or `/<prefix>/healthz`).
 - [ ] `MCP_SESSION_POLICY=strict`; a tool call without `session_id` returns `Error (missing session)`; two sessions cannot see each other's output directory or plots (`test_session_isolation.py` green).
 - [ ] Image contains **no** `NEO4J_PASSWORD` (`docker inspect ... | grep -i password` → empty); container **refuses to start** without creds in remote mode.
 - [ ] Neo4j service user is **read-only**; APOC installed; Bolt reachable only from the task SG.

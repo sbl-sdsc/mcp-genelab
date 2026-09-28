@@ -271,7 +271,7 @@ docker run \
   mcp-genelab:latest
 ```
 
-The MCP server is then accessible at `http://localhost:8000/mcp/`, with `GET http://localhost:8000/healthz` (liveness) and `GET http://localhost:8000/readyz` (readiness — pings Neo4j) for load balancers. In any remote transport the server defaults to `MCP_SESSION_POLICY=strict`: clients must call `create_session` first and pass the returned `session_id` on every tool call (see [docs/api.md](docs/api.md#sessions-public-endpoint)).
+The MCP server is then accessible at `http://localhost:8000/mcp/`, with `GET http://localhost:8000/healthz` (liveness) and `GET http://localhost:8000/readyz` (readiness — pings Neo4j) for load balancers (all under `MCP_PATH_PREFIX` if one is set, e.g. `/kg/mcp`). In any remote transport the server defaults to `MCP_SESSION_POLICY=strict`: clients must call `create_session` first and pass the returned `session_id` on every tool call (see [docs/api.md](docs/api.md#sessions-public-endpoint)).
 
 
 ### Environment Variables
@@ -285,6 +285,7 @@ The MCP server is then accessible at `http://localhost:8000/mcp/`, with `GET htt
 | `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, `streamable-http`, or `http` |
 | `MCP_HOST` | `127.0.0.1` | HTTP listener host (use `0.0.0.0` for Docker) |
 | `MCP_PORT` | `8000` | HTTP listener port |
+| `MCP_PATH_PREFIX` | *(empty)* | Public path prefix when a load balancer publishes the service under one, e.g. `/kg` → `POST /kg/mcp`, `GET /kg/healthz`, `/kg/readyz`, `/kg/metrics` |
 | `MCP_SESSION_POLICY` | `strict` (remote) / `implicit` (stdio) | `strict`: every tool except `create_session` requires a valid `session_id`; `lenient`: only state-bearing tools do; `implicit`: fixed local session |
 | `MCP_SESSION_IDLE_TTL_SECONDS` / `MCP_SESSION_MAX_AGE_SECONDS` | `3600` / `28800` | Session idle and absolute lifetimes |
 | `MCP_MAX_SESSIONS` / `MCP_MAX_PLOTS_PER_SESSION` / `MCP_MAX_TOTAL_PLOT_BYTES` | `10000` / `8` / `268435456` | Session-store bounds |
@@ -409,7 +410,7 @@ As a second layer of defense, the `query` tool includes a regex-based write filt
 
 ## Testing
 
-The project ships a pytest suite (196 tests across 11 test files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees), per-session isolation (two sessions can never see each other's output directory or plots; missing/unknown/expired session errors; TTL and memory bounds), the `/healthz` / `/readyz` load-balancer routes, and the usage-metrics pipeline.
+The project ships a pytest suite (199 tests across 11 test files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees), per-session isolation (two sessions can never see each other's output directory or plots; missing/unknown/expired session errors; TTL and memory bounds), the `/healthz` / `/readyz` load-balancer routes, and the usage-metrics pipeline.
 
 ```bash
 pip install -r mcp-genelab-tests/requirements-test.txt

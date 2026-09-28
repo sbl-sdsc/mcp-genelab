@@ -409,6 +409,53 @@ def test_metrics_endpoint_when_enabled(server_module, driver, monkeypatch):
         assert rj.json()["tools"]["get_output_directory"]["calls"] == 1
 
 
+def test_normalize_prefix_forms(server_module):
+    n = server_module._normalize_prefix
+    assert n(None) == "" and n("") == "" and n("/") == "" and n("  ") == ""
+    assert n("kg") == "/kg" and n("/kg") == "/kg" and n("kg/") == "/kg" and n("/kg/") == "/kg"
+    assert n("/a/b/") == "/a/b"
+
+
+def test_default_prefix_serves_routes_at_root(server_module):
+    assert server_module.PATH_PREFIX == ""
+    assert server_module.MCP_PATH == "/mcp"
+    assert server_module.STREAMABLE_HTTP_OPTIONS["streamable_http_path"] == "/mcp"
+    assert (server_module.HEALTHZ_PATH, server_module.READYZ_PATH, server_module.METRICS_PATH) == (
+        "/healthz", "/readyz", "/metrics")
+
+
+def test_path_prefix_moves_every_route(server_module, driver, monkeypatch):
+    """MCP_PATH_PREFIX=/kg (ALB/CloudFront publish the service under a prefix
+    and cannot rewrite paths): POST /kg/mcp, GET /kg/healthz, /kg/readyz and
+    /kg/metrics must all answer, and the root paths must NOT."""
+    from starlette.testclient import TestClient
+    monkeypatch.setattr(server_module, "PATH_PREFIX", "/kg")
+    monkeypatch.setattr(server_module, "MCP_PATH", "/kg/mcp")
+    monkeypatch.setattr(server_module, "HEALTHZ_PATH", "/kg/healthz")
+    monkeypatch.setattr(server_module, "READYZ_PATH", "/kg/readyz")
+    monkeypatch.setattr(server_module, "METRICS_PATH", "/kg/metrics")
+    monkeypatch.setattr(server_module._metrics, "METRICS_ENDPOINT_ENABLED", True)
+    opts = dict(server_module.STREAMABLE_HTTP_OPTIONS, streamable_http_path="/kg/mcp")
+    monkeypatch.setattr(server_module, "STREAMABLE_HTTP_OPTIONS", opts)
+    server_module._metrics.reset()
+    driver.set_route(lambda q, p: [{"ok": 1}])
+    srv = server_module.create_mcp_server(driver, database="testdb", instructions="")
+    H = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "x", "version": "1"}}}
+    with TestClient(srv.streamable_http_app(**opts), base_url="http://127.0.0.1:8000") as c:
+        assert c.get("/kg/healthz").status_code == 200
+        assert c.get("/kg/readyz").status_code == 200
+        assert c.get("/kg/metrics").status_code == 200
+        r = c.post("/kg/mcp", headers=H, json=init)
+        assert r.status_code == 200 and "mcp-genelab" in r.text
+        # nothing is served at the root any more
+        assert c.get("/healthz").status_code == 404
+        assert c.get("/readyz").status_code == 404
+        assert c.get("/metrics").status_code == 404
+        assert c.post("/mcp", headers=H, json=init).status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Usage metrics
 # ---------------------------------------------------------------------------
