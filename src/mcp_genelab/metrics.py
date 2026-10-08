@@ -8,7 +8,7 @@ fits the account's tooling; all can be on at once:
    transports, OFF for stdio): one JSON line on **stderr** per tool call, e.g.::
 
        {"event":"tool_call","tool":"create_volcano_plot","session":"3f1a…",
-        "status":"ok","duration_ms":412.7,"client":"claude-ai/1.0","ts":"…"}
+        "status":"ok","duration_ms":412.7,"response_bytes":5120,"client":"claude-ai/1.0","ts":"…"}
 
    With the ECS ``awslogs`` log driver these land in CloudWatch Logs where
    Logs Insights can aggregate them (``stats count() by tool``) and metric
@@ -121,6 +121,8 @@ class _ToolStats:
     errors: int = 0
     latency_ms_sum: float = 0.0
     latency_ms_max: float = 0.0
+    response_bytes_sum: int = 0
+    response_bytes_max: int = 0
     last_call_ts: float = 0.0
 
 
@@ -144,6 +146,7 @@ class MetricsRegistry:
         client: str = "",
         error_type: Optional[str] = None,
         client_fp: str = "",
+        response_bytes: int = 0,
     ) -> None:
         with self._lock:
             s = self.tools[tool]
@@ -152,6 +155,8 @@ class MetricsRegistry:
                 s.errors += 1
             s.latency_ms_sum += duration_ms
             s.latency_ms_max = max(s.latency_ms_max, duration_ms)
+            s.response_bytes_sum += int(response_bytes)
+            s.response_bytes_max = max(s.response_bytes_max, int(response_bytes))
             s.last_call_ts = time.time()
 
         if USAGE_LOG_ENABLED:
@@ -164,11 +169,12 @@ class MetricsRegistry:
                 "status": status,
                 "error_type": error_type,
                 "duration_ms": round(duration_ms, 1),
+                "response_bytes": int(response_bytes),
                 "client": client[:120] if client else "",
                 "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             })
         if EMF_ENABLED:
-            _emit_line(self._emf_tool_call(tool, duration_ms, status))
+            _emit_line(self._emf_tool_call(tool, duration_ms, status, response_bytes))
 
     def record_client_initialized(
         self,
@@ -236,7 +242,7 @@ class MetricsRegistry:
     def _now_ms() -> int:
         return int(time.time() * 1000)
 
-    def _emf_tool_call(self, tool: str, duration_ms: float, status: str) -> dict[str, Any]:
+    def _emf_tool_call(self, tool: str, duration_ms: float, status: str, response_bytes: int = 0) -> dict[str, Any]:
         return {
             "_aws": {
                 "Timestamp": self._now_ms(),
@@ -247,6 +253,7 @@ class MetricsRegistry:
                         {"Name": "ToolCalls", "Unit": "Count"},
                         {"Name": "ToolErrors", "Unit": "Count"},
                         {"Name": "ToolLatencyMs", "Unit": "Milliseconds"},
+                        {"Name": "ToolResponseBytes", "Unit": "Bytes"},
                     ],
                 }],
             },
@@ -255,6 +262,7 @@ class MetricsRegistry:
             "ToolCalls": 1,
             "ToolErrors": 0 if status == "ok" else 1,
             "ToolLatencyMs": round(duration_ms, 1),
+            "ToolResponseBytes": int(response_bytes),
         }
 
     def _emf_simple(self, name: str, value: float, extra: Optional[dict[str, str]] = None) -> dict[str, Any]:
@@ -286,6 +294,8 @@ class MetricsRegistry:
                     "latency_ms_sum": round(s.latency_ms_sum, 1),
                     "latency_ms_avg": round(s.latency_ms_sum / s.calls, 1) if s.calls else 0.0,
                     "latency_ms_max": round(s.latency_ms_max, 1),
+                    "response_bytes_sum": s.response_bytes_sum,
+                    "response_bytes_max": s.response_bytes_max,
                 }
                 for name, s in sorted(self.tools.items())
             }
@@ -294,6 +304,7 @@ class MetricsRegistry:
                 "uptime_seconds": round(time.time() - self.started_at, 1),
                 "tool_calls_total": sum(s.calls for s in self.tools.values()),
                 "tool_errors_total": sum(s.errors for s in self.tools.values()),
+                "tool_response_bytes_total": sum(s.response_bytes_sum for s in self.tools.values()),
                 "sessions_created_total": self.sessions_created,
                 "sessions_rejected": dict(self.sessions_rejected),
                 "clients": dict(self.clients),
@@ -334,12 +345,15 @@ class MetricsRegistry:
         lines.append("# TYPE mcp_genelab_tool_latency_ms_sum counter")
         lines.append("# HELP mcp_genelab_tool_latency_ms_max Max tool latency (ms) since start.")
         lines.append("# TYPE mcp_genelab_tool_latency_ms_max gauge")
+        lines.append("# HELP mcp_genelab_tool_response_bytes_sum Sum of tool result payload sizes (bytes).")
+        lines.append("# TYPE mcp_genelab_tool_response_bytes_sum counter")
         for name, s in snap["tools"].items():
             lab = f'{{service="{svc}",tool="{name}"}}'
             lines.append(f"mcp_genelab_tool_calls_total{lab} {s['calls']}")
             lines.append(f"mcp_genelab_tool_errors_total{lab} {s['errors']}")
             lines.append(f"mcp_genelab_tool_latency_ms_sum{lab} {s['latency_ms_sum']}")
             lines.append(f"mcp_genelab_tool_latency_ms_max{lab} {s['latency_ms_max']}")
+            lines.append(f"mcp_genelab_tool_response_bytes_sum{lab} {s['response_bytes_sum']}")
         return "\n".join(lines) + "\n"
 
 

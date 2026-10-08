@@ -69,7 +69,7 @@ pytest --durations=10
 
 The full suite runs in roughly 10–15 seconds. A non-zero exit code means at least one test failed; the short traceback printed for each failure names the file, line, and assertion.
 
-## What's covered (199 tests across 11 files)
+## What's covered (201 tests across 11 files)
 
 | File | Tests | Concern |
 |---|---|---|
@@ -81,7 +81,7 @@ The full suite runs in roughly 10–15 seconds. A non-zero exit code means at le
 | `test_common_tools.py` | 4 | Functional tests of all 4 cross-assay specialist tools |
 | `test_cypher_invariants.py` | 23 | Cypher-level invariants (write-blocking incl. DROP, LIMIT, lnfc null-safety, MR filter plumbing, pooled `IN` clause) |
 | `test_plot_outputs.py` | 12 | Plot delivery via MCP resources: session-scoped `plot://{session_id}/{filename}` URI, `fetch_plot` tool, compact save instructions, dpi parity |
-| `test_session_isolation.py` | 53 | Shared-process (ECS Fargate) controls: session lifecycle, cross-session isolation of output directory + plots (tools and resource), strict/lenient/implicit policies and error messages, TTL and memory bounds, forged `Mcp-Session-Id` headers ignored, `GET /healthz` + `GET /readyz`, usage-metrics log/EMF/`/metrics`, client fingerprint and `client_initialized` identification |
+| `test_session_isolation.py` | 55 | Shared-process (ECS Fargate) controls: session lifecycle, cross-session isolation of output directory + plots (tools and resource), strict/lenient/implicit policies and error messages, TTL and memory bounds, forged `Mcp-Session-Id` headers ignored, `GET /healthz` + `GET /readyz`, usage-metrics log/EMF/`/metrics`, client fingerprint and `client_initialized` identification |
 | `test_endpoint_hardening.py` | 34 | Public-endpoint hardening: `query` rejects `LOAD CSV`, `apoc.load.*` / `apoc.export.*` / `apoc.periodic.*` and `dbms.*` while allowing `apoc.meta` / `apoc.help` introspection, `MCP_MAX_QUERY_ROWS` truncation, `MCP_QUERY_TIMEOUT_SECONDS` plumbing and timeout message, no query echo in error text, `set_output_directory` path validation, `_require_env` fail-fast, `_scrub_for_log` |
 | `test_uncovered_tools.py` | 17 | Functional invocation of the 11 tools the other files only registered: schema/metadata (`get_neo4j_schema`, `get_node_metadata`, `get_relationship_metadata`), output-dir state (`set_output_directory`, `get_output_directory`), plot generation + save script (`create_volcano_plot`, `create_venn_diagram`, `get_save_script`), and the prompt/utility tools (`clean_mermaid_diagram`, `create_chat_transcript`, `visualize_schema`) |
 

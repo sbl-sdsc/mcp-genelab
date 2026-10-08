@@ -410,7 +410,7 @@ As a second layer of defense, the `query` tool includes a regex-based write filt
 
 ## Testing
 
-The project ships a pytest suite (199 tests across 11 test files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees), per-session isolation (two sessions can never see each other's output directory or plots; missing/unknown/expired session errors; TTL and memory bounds), the `/healthz` / `/readyz` load-balancer routes, and the usage-metrics pipeline.
+The project ships a pytest suite (201 tests across 11 test files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees), per-session isolation (two sessions can never see each other's output directory or plots; missing/unknown/expired session errors; TTL and memory bounds), the `/healthz` / `/readyz` load-balancer routes, and the usage-metrics pipeline.
 
 ```bash
 pip install -r mcp-genelab-tests/requirements-test.txt

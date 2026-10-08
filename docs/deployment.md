@@ -388,11 +388,13 @@ Behind an ALB the only component that sees tool calls is the server, so it recor
 `awslogs` driver to CloudWatch Logs:
 
 ```json
-{"event":"tool_call","service":"mcp-genelab","tool":"create_volcano_plot","session":"3f1a9c0e7b2d","status":"ok","error_type":null,"duration_ms":412.7,"client":"python-httpx/0.28.1","ts":"2026-09-10T16:59:03.580+00:00"}
+{"event":"tool_call","service":"mcp-genelab","tool":"create_volcano_plot","session":"3f1a9c0e7b2d","status":"ok","error_type":null,"duration_ms":412.7,"response_bytes":48213,"client":"python-httpx/0.28.1","ts":"2026-09-10T16:59:03.580+00:00"}
 ```
 
 `status` is `ok`, `error` (the tool returned an `Error…` block) or `exception`;
-`session` is a 12-hex-char SHA-256 digest — the raw session id is a bearer
+`response_bytes` is the size of the result payload handed back to the client
+(UTF-8 text plus base64 image/blob bytes — i.e. the data volume the server
+served, before HTTP framing); `session` is a 12-hex-char SHA-256 digest — the raw session id is a bearer
 secret and is **never** logged. `session_created` (with the same `session`
 digest) and `session_rejected` (`reason` = missing/malformed/unknown/expired)
 events are emitted too.
@@ -423,12 +425,14 @@ filter event = "tool_call" | stats count() as calls, count_distinct(tool) as too
 filter event = "session_created" | stats count() as conversations by client_fp | sort conversations desc                                  # chats per client
 filter event = "session_created" | stats count_distinct(client_fp) as unique_clients, count() as conversations by bin(1d)
 filter event = "session_rejected" | stats count() by reason
+filter event = "tool_call" | stats sum(response_bytes) / 1048576 as mib_served, avg(response_bytes) as avg_bytes by tool | sort mib_served desc   # data volume per tool
+filter event = "tool_call" | stats sum(response_bytes) / 1048576 as mib_served_per_day by bin(1d)                                                # data volume per day
 ```
 
 **CloudWatch metrics via EMF (`MCP_METRICS_EMF=1`, recommended in prod).** The
 same events are also written as CloudWatch Embedded Metric Format documents,
 which CloudWatch Logs converts into metrics automatically: `ToolCalls`,
-`ToolErrors`, `ToolLatencyMs` (dimensions `Service` and `Service, Tool`),
+`ToolErrors`, `ToolLatencyMs`, `ToolResponseBytes` (dimensions `Service` and `Service, Tool`),
 `SessionsCreated`, `SessionsRejected` (`Service, Reason`), namespace
 `MCP_METRICS_NAMESPACE`. Alarm on `ToolErrors`/`ToolCalls` ratio and p95
 `ToolLatencyMs`; graph `SessionsCreated` per day for adoption.

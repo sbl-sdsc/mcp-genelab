@@ -931,8 +931,10 @@ def _install_usage_metrics(mcp: MCPServer) -> None:
         cv_token = _sessions.bind(None)
         t0 = time.perf_counter()
         status, err_type = "ok", None
+        response_bytes = 0
         try:
             result = await original(*args, **kwargs)
+            response_bytes = _result_bytes(result)
             # Tools report most failures as a TextContent starting with
             # "Error" rather than raising; classify those as soft errors so
             # the error counters reflect what the user actually saw. The
@@ -958,10 +960,44 @@ def _install_usage_metrics(mcp: MCPServer) -> None:
             _metrics.REGISTRY.record_tool_call(
                 str(name), duration_ms, status,
                 session_digest=digest, client=client, error_type=err_type,
-                client_fp=client_fp,
+                client_fp=client_fp, response_bytes=response_bytes,
             )
 
     manager.call_tool = instrumented_call_tool  # type: ignore[method-assign]
+
+
+def _result_bytes(result: Any) -> int:
+    """Approximate payload size of a tool result as the client receives it:
+    UTF-8 bytes of every text block plus the base64 length of image/blob
+    blocks (which is what travels on the wire). Never raises — metrics must
+    not break tool calls — so unknown shapes contribute 0."""
+    try:
+        content = getattr(result, "content", result)
+        if isinstance(content, tuple) and len(content) == 2 and isinstance(content[0], (list, tuple)):
+            content = content[0]
+        if not isinstance(content, (list, tuple)):
+            return 0
+        total = 0
+        for block in content:
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                total += len(text.encode("utf-8", "ignore"))
+                continue
+            data = getattr(block, "data", None)  # ImageContent / AudioContent (base64 str)
+            if isinstance(data, (str, bytes)):
+                total += len(data)
+                continue
+            res = getattr(block, "resource", None)  # EmbeddedResource
+            if res is not None:
+                rtext = getattr(res, "text", None)
+                rblob = getattr(res, "blob", None)
+                if isinstance(rtext, str):
+                    total += len(rtext.encode("utf-8", "ignore"))
+                elif isinstance(rblob, (str, bytes)):
+                    total += len(rblob)
+        return total
+    except Exception:  # pragma: no cover - defensive
+        return 0
 
 
 async def _client_identification_middleware(ctx, call_next):

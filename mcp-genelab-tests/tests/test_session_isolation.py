@@ -409,6 +409,31 @@ def test_metrics_endpoint_when_enabled(server_module, driver, monkeypatch):
         assert rj.json()["tools"]["get_output_directory"]["calls"] == 1
 
 
+def test_response_bytes_measures_text_and_image_blocks(server_module):
+    """_result_bytes counts UTF-8 text bytes plus base64 image length, and
+    never raises on unknown shapes."""
+    from mcp import types
+    rb = server_module._result_bytes
+    text = types.TextContent(type="text", text="héllo")          # 6 UTF-8 bytes
+    img = types.ImageContent(type="image", data="QUJD" * 10, mime_type="image/png")  # 40 chars
+    assert rb([text]) == 6
+    assert rb([text, img]) == 46
+    assert rb(([text], {"x": 1})) == 6          # (content, structured) tuple form
+    assert rb(None) == 0 and rb(object()) == 0
+
+
+def test_response_bytes_reach_metrics_snapshot(server_module, driver):
+    m = server_module._metrics
+    m.reset()
+    driver.set_route(lambda q, p: [{"n": "x" * 1000}])
+    srv = server_module.create_mcp_server(driver, database="testdb", instructions="")
+    call_tool_sync(srv, "query", {"query": "MATCH (n) RETURN n"})
+    snap = m.REGISTRY.snapshot()
+    assert snap["tools"]["query"]["response_bytes_sum"] >= 1000
+    assert snap["tool_response_bytes_total"] == snap["tools"]["query"]["response_bytes_sum"]
+    assert "mcp_genelab_tool_response_bytes_sum" in m.REGISTRY.prometheus_text()
+
+
 def test_normalize_prefix_forms(server_module):
     n = server_module._normalize_prefix
     assert n(None) == "" and n("") == "" and n("/") == "" and n("  ") == ""
@@ -483,6 +508,8 @@ def test_tool_calls_are_counted_and_logged(server_module, caplog, strict_mcp_ser
     assert "session_created" in kinds and kinds.count("tool_call") == 4  # incl. create_session
     tc = [e for e in events if e["event"] == "tool_call"]
     assert all("duration_ms" in e and "status" in e for e in tc)
+    assert all(isinstance(e.get("response_bytes"), int) and e["response_bytes"] > 0 for e in tc), \
+        "every tool_call event must carry the result payload size"
     # The raw session id is a bearer secret and must never be logged.
     assert not any(sid in r.getMessage() for r in caplog.records)
     assert any(e["session"] == server_module._sessions.session_id_digest(sid) for e in tc)
@@ -502,7 +529,7 @@ def test_emf_document_shape_when_enabled(server_module, monkeypatch, caplog):
     assert directive["Namespace"] == m.METRICS_NAMESPACE
     assert ["Service", "Tool"] in directive["Dimensions"]
     names = {x["Name"] for x in directive["Metrics"]}
-    assert names == {"ToolCalls", "ToolErrors", "ToolLatencyMs"}
+    assert names == {"ToolCalls", "ToolErrors", "ToolLatencyMs", "ToolResponseBytes"}
     assert d["Tool"] == "query" and d["ToolCalls"] == 1 and d["ToolLatencyMs"] == 12.5
     assert isinstance(d["_aws"]["Timestamp"], int)
 
