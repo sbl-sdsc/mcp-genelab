@@ -101,14 +101,15 @@ The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types:
 ### Visualization
 - **Volcano Plots**: Generate volcano plots showing differentially expressed genes / methylated regions / abundant organisms with significance thresholds
 - **Venn Diagrams**: Create Venn diagrams comparing differentially expressed genes (or DMRs, or DA organisms) across 2 or 3 assays, including an `expression_methylation` 2×2 grid variant for paired transcriptomic-epigenomic comparisons
-- **Plot Resource Layer**: Every generated plot is exposed as an MCP resource under `plot://<filename>` and via a `fetch_plot` tool, so clients can retrieve PNG bytes through a separate request from the tool call that produced them. A failed fetch can be retried without re-running the analysis
+- **Plot Resource Layer**: Every generated plot is exposed as an MCP resource under `plot://<session_id>/<filename>` and via a `fetch_plot` tool, so clients can retrieve PNG bytes through a separate request from the tool call that produced them. A failed fetch can be retried without re-running the analysis
 - **Schema Visualization**: Generate visual representations of the knowledge graph schema
 - **Mermaid Class Diagrams**: Create and clean Mermaid-format class diagrams of the KG schema
 
 ### Infrastructure
 - **Read-Only Enforcement**: All Neo4j sessions use `READ_ACCESS` mode — write operations are rejected at the Bolt protocol level, protecting the knowledge graph from modification
 - **Multiple Transport Modes**: Supports STDIO (local), SSE, and Streamable HTTP (remote deployment)
-- **Remote Deployment**: Deploy as a web service behind a TLS reverse proxy, accessible via HTTPS URL from any MCP client
+- **Remote Deployment**: Deploy as a web service behind a TLS reverse proxy (target: CloudFront + WAF → ALB → ECS Fargate), accessible via HTTPS URL from any MCP client. Ships `GET /healthz` / `GET /readyz` routes for load-balancer health checks and built-in usage metrics (JSON usage log, CloudWatch EMF, optional `/metrics`) — see [docs/deployment.md](docs/deployment.md)
+- **Session Scoping**: The hosted server is one shared process serving many users, so per-user state (output directory, plot registry) is keyed on a `session_id` obtained from `create_session` and passed on every tool call — nothing a user does is visible to another session
 - **Docker Support**: Build and deploy as a Docker container for consistent, reproducible environments
 - **Multiple Access Methods**: Use through Claude Desktop, VS Code with GitHub Copilot, or any MCP-compatible client
 - **Pre-configured Setup**: Ready-to-use mcp-genelab configuration files for a local STDIO connection to the spoke-genelab-v0.3.1 KG (a remote public endpoint is coming soon)
@@ -270,20 +271,28 @@ docker run \
   mcp-genelab:latest
 ```
 
-The MCP server is then accessible at `http://localhost:8000/mcp/`.
+The MCP server is then accessible at `http://localhost:8000/mcp/`, with `GET http://localhost:8000/healthz` (liveness) and `GET http://localhost:8000/readyz` (readiness — pings Neo4j) for load balancers (all under `MCP_PATH_PREFIX` if one is set, e.g. `/kg/mcp`). In any remote transport the server defaults to `MCP_SESSION_POLICY=strict`: clients must call `create_session` first and pass the returned `session_id` on every tool call (see [docs/api.md](docs/api.md#sessions-public-endpoint)).
 
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j Bolt connection URI |
-| `NEO4J_USERNAME` | `neo4j` | Neo4j username |
-| `NEO4J_PASSWORD` | `neo4jdemo` | Neo4j password |
+| `NEO4J_URI` | `bolt://localhost:7687` (stdio only) | Neo4j Bolt connection URI — **required** in remote transports (no default; the server refuses to start without it) |
+| `NEO4J_USERNAME` | `neo4j` (stdio only) | Neo4j username — **required** in remote transports |
+| `NEO4J_PASSWORD` | `neo4jdemo` (stdio only) | Neo4j password — **required** in remote transports; inject from a secret store |
 | `NEO4J_DATABASE` | `spoke-genelab-v0.3.1` | Neo4j database name for the spoke-genelab-v0.3.1 KG |
 | `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, `streamable-http`, or `http` |
 | `MCP_HOST` | `127.0.0.1` | HTTP listener host (use `0.0.0.0` for Docker) |
 | `MCP_PORT` | `8000` | HTTP listener port |
+| `MCP_PATH_PREFIX` | *(empty)* | Public path prefix when a load balancer publishes the service under one, e.g. `/kg` → `POST /kg/mcp`, `GET /kg/healthz`, `/kg/readyz`, `/kg/metrics` |
+| `MCP_SESSION_POLICY` | `strict` (remote) / `implicit` (stdio) | `strict`: every tool except `create_session` requires a valid `session_id`; `lenient`: only state-bearing tools do; `implicit`: fixed local session |
+| `MCP_SESSION_IDLE_TTL_SECONDS` / `MCP_SESSION_MAX_AGE_SECONDS` | `3600` / `28800` | Session idle and absolute lifetimes |
+| `MCP_MAX_SESSIONS` / `MCP_MAX_PLOTS_PER_SESSION` / `MCP_MAX_TOTAL_PLOT_BYTES` | `10000` / `8` / `268435456` | Session-store bounds |
+| `MCP_QUERY_TIMEOUT_SECONDS` / `MCP_MAX_QUERY_ROWS` | `60` / `1000` | Per-query timeout; row cap for the `query` tool |
+| `MCP_NEO4J_POOL_SIZE` / `MCP_NEO4J_ACQUISITION_TIMEOUT` | `20` / `30` | Bolt pool per process; fail-fast on saturation |
+| `MCP_USAGE_LOG` / `MCP_METRICS_EMF` / `MCP_METRICS_ENDPOINT` | `1` / `0` / `0` | Usage metrics: JSON usage log, CloudWatch EMF, `GET /metrics` |
+| `MCP_LOG_LEVEL` | `INFO` | Application log level |
 | `INSTRUCTIONS` | *(see source)* | System instructions for the LLM |
 
 ## Example Queries
@@ -320,7 +329,7 @@ The MCP server is then accessible at `http://localhost:8000/mcp/`.
 
 ## MCP Tools Reference
 
-The server exposes **22 tools** plus a `plot://{filename}` resource template. Tools are listed below grouped by category. The specialist tools should be preferred over the generic `query` tool — server.py's `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
+The server exposes **24 tools** (22 analysis/utility tools plus `create_session` / `end_session`) and a `plot://{session_id}/{filename}` resource template. On the hosted endpoint every tool except `create_session` takes a `session_id` argument (see [docs/api.md](docs/api.md#sessions-public-endpoint)). Tools are listed below grouped by category. The specialist tools should be preferred over the generic `query` tool — server.py's `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
 
 ### Schema & metadata
 
@@ -367,16 +376,18 @@ The server exposes **22 tools** plus a `plot://{filename}` resource template. To
 |------|-------------|
 | `create_volcano_plot` | Generate a volcano plot of differential expression / methylation / abundance results; PNG returned inline and registered for resource fetch |
 | `create_venn_diagram` | Create a Venn diagram comparing DEGs / DMRs / DA organisms across 2 or 3 assays (also supports the `expression_methylation` 2×2 grid variant); PNG returned inline and registered for resource fetch |
-| `fetch_plot` | Re-fetch the canonical PNG bytes of a previously generated plot from the in-memory registry (last 8 plots, FIFO eviction). Returns the bytes as an `EmbeddedResource` so clients can render them inline. Safe to call repeatedly — no Cypher, no matplotlib, no re-render |
+| `fetch_plot` | Re-fetch the canonical PNG bytes of a plot previously generated in the same session from the in-memory registry (last 8 plots per session, FIFO eviction). Returns the bytes as an `EmbeddedResource` so clients can render them inline. Safe to call repeatedly — no Cypher, no matplotlib, no re-render |
 | `get_save_script` | Return a markdown block with multiple save options for a previously generated plot: right-click save, ask-LLM-client-to-save, or fetch via the `plot://` resource URI |
-| `plot://{filename}` (resource) | MCP resource template — clients fetch PNG bytes via `resources/read` on `plot://<suggested_filename>`. Decoupled from the tool response that generated the plot, so a failed fetch can be retried without re-running the analysis |
+| `plot://{session_id}/{filename}` (resource) | MCP resource template — clients fetch PNG bytes via `resources/read` on `plot://<session_id>/<suggested_filename>`. Session-scoped so one user's plot is never addressable from another session; decoupled from the tool response that generated the plot, so a failed fetch can be retried without re-running the analysis |
 
-### Output paths
+### Sessions and output paths
 
 | Tool | Description |
 |------|-------------|
-| `set_output_directory` | Set the user-facing directory where plots and CSV files should be saved |
-| `get_output_directory` | Return the currently configured output directory |
+| `create_session` | Start a session and obtain the `session_id` that every other tool requires on the hosted endpoint (call first; call again if a tool reports the session unknown/expired) |
+| `end_session` | End a session immediately, discarding its output directory and plots |
+| `set_output_directory` | Set the user-facing directory where plots and CSV files should be saved (per session) |
+| `get_output_directory` | Return the currently configured output directory (per session) |
 
 ### Mermaid & transcript utilities
 
@@ -399,7 +410,7 @@ As a second layer of defense, the `query` tool includes a regex-based write filt
 
 ## Testing
 
-The project ships a pytest suite (95 tests across 8 files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), and the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees).
+The project ships a pytest suite (201 tests across 11 test files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees), per-session isolation (two sessions can never see each other's output directory or plots; missing/unknown/expired session errors; TTL and memory bounds), the `/healthz` / `/readyz` load-balancer routes, and the usage-metrics pipeline.
 
 ```bash
 pip install -r mcp-genelab-tests/requirements-test.txt

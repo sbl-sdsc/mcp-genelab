@@ -1,7 +1,9 @@
 """Tests for the public-endpoint hardening added to server.py.
 
-These cover the security/operational controls introduced for the CloudFront →
-AgentCore Gateway (CUSTOM_JWT) → AgentCore Runtime deployment:
+These cover the security/operational controls for the public deployment
+(CloudFront + WAF → ALB → ECS Fargate → Neo4j on EC2). Per-session isolation
+for that shared-process topology is covered separately in
+test_session_isolation.py.
 
   - Forbidden-procedure blocking in the `query` tool (LOAD CSV, apoc.load.*,
     apoc.export.*, dbms.*) — the read-only-but-dangerous operations that Bolt

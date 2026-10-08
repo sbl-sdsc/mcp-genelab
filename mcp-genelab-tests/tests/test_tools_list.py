@@ -1,7 +1,8 @@
 """Tools-list inspection tests.
 
 What this file guards:
-  - All 22 expected tools register correctly with FastMCP.
+  - All 24 expected tools register correctly with FastMCP (22 analysis/
+    utility tools + the create_session / end_session lifecycle pair).
   - Every tool has a `title` annotation (human-readable, shown by clients).
   - Every tool declares readOnlyHint, idempotentHint, and openWorldHint —
     the three behavioral hints from the MCP spec that clients use for
@@ -17,6 +18,8 @@ from __future__ import annotations
 
 
 EXPECTED_TOOLS = {
+    "create_session",
+    "end_session",
     "get_neo4j_schema",
     "set_output_directory",
     "get_output_directory",
@@ -43,7 +46,7 @@ EXPECTED_TOOLS = {
 
 
 def test_expected_tool_count(tools_list):
-    """22 tools are expected. A higher number means an undocumented tool was
+    """24 tools are expected. A higher number means an undocumented tool was
     added; a lower number means one was removed or failed to register."""
     assert len(tools_list) == len(EXPECTED_TOOLS), (
         f"Expected {len(EXPECTED_TOOLS)} tools, got {len(tools_list)}: "
@@ -83,7 +86,7 @@ def test_all_tools_declare_read_only_hint(tools_list):
     to safety-prompt UI or not."""
     missing = [
         t.name for t in tools_list
-        if getattr(t.annotations, "readOnlyHint", None) is None
+        if getattr(t.annotations, "read_only_hint", None) is None
     ]
     assert not missing, f"Tools missing readOnlyHint: {missing}"
 
@@ -93,7 +96,7 @@ def test_all_tools_declare_idempotent_hint(tools_list):
     produce identical side effects. Every tool must declare it explicitly."""
     missing = [
         t.name for t in tools_list
-        if getattr(t.annotations, "idempotentHint", None) is None
+        if getattr(t.annotations, "idempotent_hint", None) is None
     ]
     assert not missing, f"Tools missing idempotentHint: {missing}"
 
@@ -104,13 +107,13 @@ def test_all_tools_declare_open_world_hint(tools_list):
     openWorldHint=True — we only touch one local Neo4j."""
     missing = [
         t.name for t in tools_list
-        if getattr(t.annotations, "openWorldHint", None) is None
+        if getattr(t.annotations, "open_world_hint", None) is None
     ]
     assert not missing, f"Tools missing openWorldHint: {missing}"
 
     # Stronger guarantee: no tool actually reaches an external service.
     open_world = [
-        t.name for t in tools_list if t.annotations.openWorldHint is True
+        t.name for t in tools_list if t.annotations.open_world_hint is True
     ]
     assert not open_world, (
         f"Tools claiming openWorldHint=True (this server only reads local "
@@ -142,9 +145,9 @@ def test_plot_tools_are_not_read_only(tools_list):
     NOT advertise readOnlyHint=True."""
     for name in ("create_volcano_plot", "create_venn_diagram"):
         t = next(tt for tt in tools_list if tt.name == name)
-        assert t.annotations.readOnlyHint is False, (
+        assert t.annotations.read_only_hint is False, (
             f"{name} writes files; readOnlyHint should be False, "
-            f"got {t.annotations.readOnlyHint}"
+            f"got {t.annotations.read_only_hint}"
         )
 
 
@@ -170,7 +173,7 @@ def test_data_tools_are_read_only(tools_list):
     }
     for name in read_only_expected:
         t = next(tt for tt in tools_list if tt.name == name)
-        assert t.annotations.readOnlyHint is True, (
+        assert t.annotations.read_only_hint is True, (
             f"{name} only reads from Neo4j; readOnlyHint should be True, "
-            f"got {t.annotations.readOnlyHint}"
+            f"got {t.annotations.read_only_hint}"
         )
