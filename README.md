@@ -71,7 +71,9 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
 
 ## Knowledge Graph Schema (v0.3.1)
 
-The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types:
+The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types: 
+> The MCP-GeneLab server uses the [SPOKE-GeneLab v0.3.1-20260311](https://github.com/BaranziniLab/spoke_genelab/tree/v0.3.1-20260311) release. 
+> *Any new datasets or processed data added to OSDR after March 11, 2026 is not available through the MCP-GeneLab server.*  
 
 **Nodes:** Study, Mission, Assay, MGene, Gene, MethylationRegion, Organism, Anatomy, CellType
 

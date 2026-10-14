@@ -1,8 +1,8 @@
 # MCP-Genelab Change Log
 
-# v0.4.0 → v0.5.0
+# v0.4.0 → v1.0.0
 
-| | v0.4.0 | v0.5.0 |
+| | v0.4.0 | v1.0.0 |
 |---|---|---|
 | MCP SDK | `mcp>=1.6.0` (FastMCP, 1.x) | `mcp>=2.2.0,<3` (`MCPServer`, 2.x) |
 | Tools | 22 + `plot://{filename}` resource | **24** + `plot://{session_id}/{filename}` resource |
@@ -118,10 +118,12 @@
 ## 9. Configuration, packaging, docs
 
 - `config/claude_desktop_config.json`, `claude_desktop_config_dev.json`, `mcp.json`, `mcp_dev.json`: added a `_securityNote` (local placeholders only; hosted deployment takes injected secrets); args reformatted; no values changed.
-- `pyproject.toml`: `mcp>=2.2.0,<3`, `starlette>=0.27`, second author added (Amanda Saravia-Butler), description updated; version 0.5.0.
+- `pyproject.toml`: `mcp>=2.2.0,<3`, `starlette>=0.27`, second author added (Amanda Saravia-Butler), description updated; version 1.0.0.
 - `docs/deployment.md` **(new, ~500 lines)**: public-endpoint runbook — architecture, secrets/egress, full env reference, query cost controls, WAF, session isolation, ECS/ALB configuration (target group, task definition, service, security groups, certificates), observability and per-conversation metrics with Logs Insights queries, Neo4j hardening, auth per client, pre-launch checklist, known limitations; `MCP_PATH_PREFIX` documented in the env reference, health-check section (prefixed `HealthCheckPath` / container healthCheck), sample task definition, `/metrics` paragraph and checklist.
 - `docs/api.md`: 24 tools; new "Sessions (public endpoint)" section; `create_session`/`end_session` entries; `session_id` parameter; `plot://{session_id}/{filename}`.
-- `README.md`: session-scoping and remote-deployment feature bullets, health routes in the Docker section, expanded environment-variable table (required-in-remote credentials, session/metrics/query-control variables, `MCP_PATH_PREFIX`), 24-tool reference with a "Sessions and output paths" group, testing paragraph.
+- `README.md`: session-scoping and remote-deployment feature bullets; Quick Start **Option A** now has per-client connection instructions for the public endpoint (Claude Desktop / claude.ai, ChatGPT, VS Code with GitHub Copilot, Gemini app and Gemini CLI) with links to each vendor's custom-MCP documentation, and the Prerequisites client list matches; the standalone "Configure MCP Tools (Claude Desktop)" section was removed (superseded by Option A; its transcript tip moved to Example Queries); health routes and `MCP_PATH_PREFIX` in the Docker section; expanded environment-variable table (required-in-remote credentials, session/metrics/query-control variables, `MCP_PATH_PREFIX`, `MCP_SESSION_EVICTION_MIN_IDLE_SECONDS`, `MCP_MAX_REQUEST_BODY_BYTES`, `MCP_READYZ_*`, `MCP_USAGE_FP_SALT`, `MCP_METRICS_NAMESPACE`, `MCP_SERVICE_NAME`); 24-tool reference with a "Sessions and output paths" group; Security section extended with the forbidden-procedure filter, query timeout/row cap, runtime-injected credentials and session isolation; Troubleshooting entries for the new `query` rejection text and the `Error (missing|unknown|expired session)` messages; new "Demos" subsection under Example Queries; link to `CHANGELOG.md`; testing paragraph.
+- `docs/examples/HBISS_03-2026_Demos/` moved to `docs/examples/demos/HBISS_03-2026_Demos/` (content unchanged) and linked from the README.
+- `docs/build_publish.md`: version-bump line notes `uv version 1.0.0` for setting an explicit version.
 
 ---
 
@@ -136,13 +138,12 @@
 
 ---
 
-## 11. Environment variables added in 0.5.0
+## 11. Environment variables added in 1.0.0
 
 `MCP_LOG_LEVEL`, `MCP_QUERY_TIMEOUT_SECONDS`, `MCP_MAX_QUERY_ROWS`, `MCP_NEO4J_POOL_SIZE`, `MCP_NEO4J_ACQUISITION_TIMEOUT`, `MCP_MAX_REQUEST_BODY_BYTES`, `MCP_READYZ_TIMEOUT_SECONDS`, `MCP_READYZ_CACHE_SECONDS`, `MCP_SESSION_POLICY`, `MCP_SESSION_IDLE_TTL_SECONDS`, `MCP_SESSION_MAX_AGE_SECONDS`, `MCP_MAX_SESSIONS`, `MCP_SESSION_EVICTION_MIN_IDLE_SECONDS`, `MCP_MAX_PLOTS_PER_SESSION`, `MCP_MAX_TOTAL_PLOT_BYTES`, `MCP_USAGE_LOG`, `MCP_USAGE_FP_SALT`, `MCP_METRICS_EMF`, `MCP_METRICS_NAMESPACE`, `MCP_METRICS_ENDPOINT`, `MCP_SERVICE_NAME`, `MCP_PATH_PREFIX`. Pre-existing and unchanged: `NEO4J_*`, `MCP_TRANSPORT`, `MCP_HOST`, `MCP_PORT`, `INSTRUCTIONS`.
 
 ---
 
-## 12. Files not changed between 0.4.0 and 0.5.0
+## 12. Files not changed between 0.4.0 and 1.0.0
 
-`LICENSE`, `.gitignore`, `glama.json`, `src/mcp_genelab/__init__.py`, `docs/installation.md`, `docs/development.md`, `docs/build_publish.md`, `docs/examples/**`, `docs/images/**`, `mcp-genelab-tests/pytest.ini`, `test_common_tools.py`, `test_query_routing.py`, `test_specialist_docstrings.py`.
-
+`LICENSE`, `.gitignore`, `glama.json`, `src/mcp_genelab/__init__.py`, `docs/installation.md`, `docs/development.md`, `docs/examples/*.md` (the example transcripts; the `HBISS_03-2026_Demos` folder was moved, not edited), `mcp-genelab-tests/pytest.ini`, `test_common_tools.py`, `test_query_routing.py`, `test_specialist_docstrings.py`.
