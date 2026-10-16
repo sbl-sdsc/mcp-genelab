@@ -34,8 +34,12 @@ def test_query_tool_rejects_each_write_verb(verb, driver, mcp_server):
         mcp_server, "query",
         {"query": f"{verb} (n:Foo) RETURN n"},
     )
-    assert "Error" in text
-    assert "Only read" in text
+    # The query must be rejected. We assert on the stable behavioral signal
+    # ("rejected" + "read-only") rather than the exact keyword, because the
+    # rejection message deliberately no longer echoes which write verb tripped
+    # (that echo was a minor info-leak on a public endpoint).
+    assert "rejected" in text.lower()
+    assert "read-only" in text.lower()
 
 
 @pytest.mark.parametrize("verb_case", [
@@ -50,7 +54,7 @@ def test_query_tool_write_block_is_case_insensitive(
         mcp_server, "query",
         {"query": f"{verb_case} (n:Foo) RETURN n"},
     )
-    assert "Error" in text
+    assert "rejected" in text.lower()
 
 
 # --- lnfc null-safety in abundance queries --------------------------------

@@ -22,11 +22,14 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
   - [Infrastructure](https://github.com/sbl-sdsc/mcp-genelab/tree/main#infrastructure)
 - [Prerequisites](https://github.com/sbl-sdsc/mcp-genelab/tree/main#prerequisites)
 - [Quick Start](https://github.com/sbl-sdsc/mcp-genelab/tree/main#quick-start)
-  - [Option A: Connect to the Remote mcp-genelab Server (coming soon)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon)
+  - [Option A: Connect to the Remote mcp-genelab Server](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server)
+    - [Claude (Desktop or claude.ai)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#claude-desktop-or-claudeai)
+    - [ChatGPT](https://github.com/sbl-sdsc/mcp-genelab/tree/main#chatgpt)
+    - [VS Code with GitHub Copilot](https://github.com/sbl-sdsc/mcp-genelab/tree/main#vs-code-with-github-copilot)
+    - [Gemini](https://github.com/sbl-sdsc/mcp-genelab/tree/main#gemini)
   - [Option B: Run mcp-genelab Locally with STDIO](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio)
     - [Step 1 — Install Neo4j Desktop and import the spoke-genelab-v0.3.1 KG](https://github.com/sbl-sdsc/mcp-genelab/tree/main#step-1--install-neo4j-desktop-and-import-the-spoke-genelab-v031-kg)
     - [Step 2 — Install `uv` and configure mcp-genelab](https://github.com/sbl-sdsc/mcp-genelab/tree/main#step-2--install-uv-and-configure-mcp-genelab)
-  - [Configure MCP Tools (Claude Desktop)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#configure-mcp-tools-claude-desktop)
 - [Docker Deployment](https://github.com/sbl-sdsc/mcp-genelab/tree/main#docker-deployment)
   - [Build the MCP Server Image](https://github.com/sbl-sdsc/mcp-genelab/tree/main#build-the-mcp-server-image)
   - [Run with Streamable HTTP Transport](https://github.com/sbl-sdsc/mcp-genelab/tree/main#run-with-streamable-http-transport)
@@ -38,6 +41,7 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
   - [Differential Expression and Differential Methylation Analysis with MCP tools](https://github.com/sbl-sdsc/mcp-genelab/tree/main#differential-expression-and-differential-methylation-analysis-with-mcp-tools)
   - [Differential Abundance Analysis with MCP tools](https://github.com/sbl-sdsc/mcp-genelab/tree/main#differential-abundance-analysis-with-mcp-tools)
   - [Cross-Graph Differential Expression and Associated Disease Analysis with MCP tools](https://github.com/sbl-sdsc/mcp-genelab/tree/main#cross-graph-differential-expression-and-associated-disease-analysis-with-mcp-tools)
+  - [Demos](https://github.com/sbl-sdsc/mcp-genelab/tree/main#demos)
 - [MCP Tools Reference](https://github.com/sbl-sdsc/mcp-genelab/tree/main#mcp-tools-reference)
   - [Schema & metadata](https://github.com/sbl-sdsc/mcp-genelab/tree/main#schema--metadata)
   - [Study / assay browsing](https://github.com/sbl-sdsc/mcp-genelab/tree/main#study--assay-browsing)
@@ -45,7 +49,7 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
   - [Cross-assay analyses](https://github.com/sbl-sdsc/mcp-genelab/tree/main#cross-assay-analyses)
   - [Cypher fallback](https://github.com/sbl-sdsc/mcp-genelab/tree/main#cypher-fallback)
   - [Plot generation, delivery, and saving](https://github.com/sbl-sdsc/mcp-genelab/tree/main#plot-generation-delivery-and-saving)
-  - [Output paths](https://github.com/sbl-sdsc/mcp-genelab/tree/main#output-paths)
+  - [Sessions and output paths](https://github.com/sbl-sdsc/mcp-genelab/tree/main#sessions-and-output-paths)
   - [Mermaid & transcript utilities](https://github.com/sbl-sdsc/mcp-genelab/tree/main#mermaid--transcript-utilities)
 - [Security](https://github.com/sbl-sdsc/mcp-genelab/tree/main#security)
 - [Development](https://github.com/sbl-sdsc/mcp-genelab/tree/main#development)
@@ -67,7 +71,9 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
 
 ## Knowledge Graph Schema (v0.3.1)
 
-The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types:
+The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types: 
+> The MCP-GeneLab server uses the [SPOKE-GeneLab v0.3.1+20260311](https://github.com/BaranziniLab/spoke_genelab/tree/v0.3.1+20260311) release. 
+> *Any new datasets or processed data added to OSDR after March 11, 2026 is not available through the MCP-GeneLab server.*  
 
 **Nodes:** Study, Mission, Assay, MGene, Gene, MethylationRegion, Organism, Anatomy, CellType
 
@@ -101,28 +107,31 @@ The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types:
 ### Visualization
 - **Volcano Plots**: Generate volcano plots showing differentially expressed genes / methylated regions / abundant organisms with significance thresholds
 - **Venn Diagrams**: Create Venn diagrams comparing differentially expressed genes (or DMRs, or DA organisms) across 2 or 3 assays, including an `expression_methylation` 2×2 grid variant for paired transcriptomic-epigenomic comparisons
-- **Plot Resource Layer**: Every generated plot is exposed as an MCP resource under `plot://<filename>` and via a `fetch_plot` tool, so clients can retrieve PNG bytes through a separate request from the tool call that produced them. A failed fetch can be retried without re-running the analysis
+- **Plot Resource Layer**: Every generated plot is exposed as an MCP resource under `plot://<session_id>/<filename>` and via a `fetch_plot` tool, so clients can retrieve PNG bytes through a separate request from the tool call that produced them. A failed fetch can be retried without re-running the analysis
 - **Schema Visualization**: Generate visual representations of the knowledge graph schema
 - **Mermaid Class Diagrams**: Create and clean Mermaid-format class diagrams of the KG schema
 
 ### Infrastructure
 - **Read-Only Enforcement**: All Neo4j sessions use `READ_ACCESS` mode — write operations are rejected at the Bolt protocol level, protecting the knowledge graph from modification
 - **Multiple Transport Modes**: Supports STDIO (local), SSE, and Streamable HTTP (remote deployment)
-- **Remote Deployment**: Deploy as a web service behind a TLS reverse proxy, accessible via HTTPS URL from any MCP client
+- **Remote Deployment**: Deploy as a web service behind a TLS reverse proxy (target: CloudFront + WAF → ALB → ECS Fargate), accessible via HTTPS URL from any MCP client. Ships `GET /healthz` / `GET /readyz` routes for load-balancer health checks and built-in usage metrics (JSON usage log, CloudWatch EMF, optional `/metrics`) — see [docs/deployment.md](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/deployment.md)
+- **Session Scoping**: The hosted server is one shared process serving many users, so per-user state (output directory, plot registry) is keyed on a `session_id` obtained from `create_session` and passed on every tool call — nothing a user does is visible to another session
 - **Docker Support**: Build and deploy as a Docker container for consistent, reproducible environments
-- **Multiple Access Methods**: Use through Claude Desktop, VS Code with GitHub Copilot, or any MCP-compatible client
-- **Pre-configured Setup**: Ready-to-use mcp-genelab configuration files for a local STDIO connection to the spoke-genelab-v0.3.1 KG (a remote public endpoint is coming soon)
+- **Multiple Access Methods**: Use through Claude Desktop / claude.ai, ChatGPT, VS Code with GitHub Copilot, Gemini, or any MCP-compatible client
+- **Pre-configured Setup**: Ready-to-use mcp-genelab configuration files for a local STDIO connection to the spoke-genelab-v0.3.1 KG, or connect to the public endpoint at `https://visualization.osdr.nasa.gov/kg/mcp` with no local install
 
 ## Prerequisites
 
 Before using mcp-genelab, ensure you have:
 
 - **Client Application**: One of the following:
-  - Claude Desktop or claude.ai (Pro or Max subscription) — connect via Settings → Connectors → Add Custom Connector
+  - Claude Desktop or claude.ai — connect via Settings → Connectors → Add Custom Connector
+  - ChatGPT (web, Developer mode) — connect via Add custom MCP server
   - VS Code with GitHub Copilot — connect via MCP server settings
+  - Gemini app (personal Google Account) or Gemini CLI — connect via Connected Apps or `gemini mcp add`
   - Any MCP client that supports the STDIO or Streamable HTTP transport
 - **Connection to the spoke-genelab-v0.3.1 knowledge graph** via one of the two paths below:
-  - **Remote public endpoint** (*coming soon*): Connect to a hosted mcp-genelab server over HTTPS — no local install required. See [Option A](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon).
+  - **Remote public endpoint**: Connect to the hosted mcp-genelab server at `https://visualization.osdr.nasa.gov/kg/mcp` over HTTPS — no local install required. See [Option A](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server).
   - **Local install with STDIO**: Run mcp-genelab on your own machine against a local Neo4j instance holding the spoke-genelab-v0.3.1 KG. See [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio).
 
 For the local STDIO setup you also need:
@@ -132,22 +141,87 @@ For the local STDIO setup you also need:
 
 ## Quick Start
 
-mcp-genelab can be reached two ways: by connecting to the **remote public endpoint** (coming soon) or by **running mcp-genelab locally with STDIO**. Both serve the `spoke-genelab-v0.3.1` knowledge graph.
+mcp-genelab can be reached two ways: by connecting to the **remote public endpoint** (`https://visualization.osdr.nasa.gov/kg/mcp`) or by **running mcp-genelab locally with STDIO**. Both serve the `spoke-genelab-v0.3.1` knowledge graph.
 
-### Option A: Connect to the Remote mcp-genelab Server (coming soon)
+### Option A: Connect to the Remote mcp-genelab Server
 
-> **Status: Coming soon.** A public HTTPS endpoint for mcp-genelab is being prepared. When it is live, the URL will be published here and in the [mcp-genelab repository](https://github.com/sbl-sdsc/mcp-genelab). Until then, use [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio) to run mcp-genelab locally.
+The public mcp-genelab endpoint is:
 
-Once the public endpoint is available, you will be able to connect to mcp-genelab without installing anything locally:
+```
+https://visualization.osdr.nasa.gov/kg/mcp
+```
+
+It is a Streamable HTTP MCP server hosted by NASA OSDR with no authentication required, so you can connect without installing anything locally. Pick your client below. (If you would rather run against your own Neo4j instance, use [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio).)
+
+#### Claude (Desktop or claude.ai)
 
 1. Open Claude Desktop (or claude.ai)
 2. Go to **Settings → Connectors** (or **Manage Connectors**)
 3. Click **Add Custom Connector**
 4. Enter:
    - **Name**: `mcp-genelab`
-   - **MCP Server URL**: *the public mcp-genelab endpoint (coming soon)*
+   - **MCP Server URL**: `https://visualization.osdr.nasa.gov/kg/mcp`
 5. Click **Save**
 6. In the chat prompt, click the **+** button and toggle the **mcp-genelab** connector **on**
+
+Documentation: [Getting started with custom connectors using remote MCP](https://support.claude.com/en/articles/11175166-about-integrations-using-remote-mcp)
+
+#### ChatGPT
+
+1. In ChatGPT on the web, open **Settings → Apps → Advanced settings** and enable **Developer mode** (Pro; on Business/Enterprise/Edu an admin must enable it)
+2. Go to [chatgpt.com/plugins](https://chatgpt.com/plugins), click **+**, then **Add custom MCP server**
+3. Enter:
+   - **Name**: `mcp-genelab`
+   - **Server URL**: `https://visualization.osdr.nasa.gov/kg/mcp`
+   - **Authentication**: **No authentication**
+4. Accept the risk notice (**I understand and want to continue**), then click **Create as a plugin** and **install** it
+5. In the chat prompt, type **@** and select **mcp-genelab**
+
+Documentation: [Add custom MCP server](https://developers.openai.com/api/docs/guides/custom-mcp-server) · [Developer mode and MCP apps in ChatGPT](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)
+
+#### VS Code with GitHub Copilot
+
+1. Open the Command Palette (Cmd+Shift+P) and run **MCP: Add Server**
+2. Choose **HTTP**, enter `https://visualization.osdr.nasa.gov/kg/mcp` as the URL and `mcp-genelab` as the server ID, and pick where to save it (workspace or global)
+3. When prompted, confirm that you **trust** the server so it starts
+
+Equivalently, add this to `.vscode/mcp.json` (or your user MCP configuration):
+
+```json
+{
+  "servers": {
+    "mcp-genelab": {
+      "type": "http",
+      "url": "https://visualization.osdr.nasa.gov/kg/mcp"
+    }
+  }
+}
+```
+
+In Copilot Chat, open the **Configure Tools** button in the chat input to confirm the mcp-genelab tools are enabled.
+
+Documentation: [Use MCP servers in VS Code](https://code.visualstudio.com/docs/agent-customization/mcp-servers)
+
+#### Gemini
+
+**Gemini app** (web; personal Google Account):
+
+1. Go to [gemini.google.com](https://gemini.google.com), click **Settings → Connected Apps** (if you don't see it, click **Personal Intelligence** first)
+2. Under **Custom apps**, click **Add a custom app** and enter `https://visualization.osdr.nasa.gov/kg/mcp`
+3. Click **Next** and follow the on-screen instructions
+4. In the chat prompt, type **@** and select the custom app
+
+Documentation: [Connect & manage custom apps for Gemini Apps](https://support.google.com/gemini/answer/17209137)
+
+**Gemini CLI** (any Google account):
+
+```bash
+gemini mcp add --transport http mcp-genelab https://visualization.osdr.nasa.gov/kg/mcp
+```
+
+or add to `~/.gemini/settings.json`: `{"mcpServers": {"mcp-genelab": {"httpUrl": "https://visualization.osdr.nasa.gov/kg/mcp"}}}`, then run `/mcp` inside Gemini CLI to confirm it is connected.
+
+Documentation: [Gemini CLI — MCP servers](https://geminicli.com/docs/tools/mcp-server/)
 
 Then ask a question like: *"What organisms are represented in the spoke-genelab-v0.3.1 knowledge graph?"*
 
@@ -218,32 +292,6 @@ For **VS Code with GitHub Copilot**, add the same mcp-genelab entry to your `.vs
 
 > **Note**: Set `NEO4J_USERNAME`, `NEO4J_PASSWORD`, and `NEO4J_URI` to match the Neo4j instance you started in Step 1. The `uvx` command automatically downloads and runs the latest published mcp-genelab from PyPI. Keep `NEO4J_DATABASE` set to `spoke-genelab-v0.3.1` to match the database name you imported.
 
-### Configure MCP Tools (Claude Desktop)
-
-From the top menu bar:
-```
-1. Select: Claude->Settings->Connectors
-2. Click: Configure for the MCP endpoints you want to use
-3. Select Tool permissions: Always allow
-```
-
-In the prompt dialog box, click the `+` button:
-```
-1. Turn off Web search
-2. Toggle MCP services on/off as needed
-```
-
-<img src="https://raw.githubusercontent.com/sbl-sdsc/mcp-genelab/main/docs/images/select_mcp_server.png"
-     alt="tool selector"
-     width="600">
-
-
-Use @kg_name to refer to a specific mcp server (for example, @mcp-genelab).
-
-To create a transcript of a chat (see examples below), use the following prompt: 
-```Create a chat transcript```. 
-The transcript can then be downloaded in .md or .pdf format.
-
 ## Docker Deployment
 
 ### Build the MCP Server Image
@@ -270,25 +318,38 @@ docker run \
   mcp-genelab:latest
 ```
 
-The MCP server is then accessible at `http://localhost:8000/mcp/`.
+The MCP server is then accessible at `http://localhost:8000/mcp/`, with `GET http://localhost:8000/healthz` (liveness) and `GET http://localhost:8000/readyz` (readiness — pings Neo4j) for load balancers (all under `MCP_PATH_PREFIX` if one is set, e.g. `/kg/mcp`). In any remote transport the server defaults to `MCP_SESSION_POLICY=strict`: clients must call `create_session` first and pass the returned `session_id` on every tool call (see [docs/api.md](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/api.md#sessions-public-endpoint)).
 
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j Bolt connection URI |
-| `NEO4J_USERNAME` | `neo4j` | Neo4j username |
-| `NEO4J_PASSWORD` | `neo4jdemo` | Neo4j password |
+| `NEO4J_URI` | `bolt://localhost:7687` (stdio only) | Neo4j Bolt connection URI — **required** in remote transports (no default; the server refuses to start without it) |
+| `NEO4J_USERNAME` | `neo4j` (stdio only) | Neo4j username — **required** in remote transports |
+| `NEO4J_PASSWORD` | `neo4jdemo` (stdio only) | Neo4j password — **required** in remote transports; inject from a secret store |
 | `NEO4J_DATABASE` | `spoke-genelab-v0.3.1` | Neo4j database name for the spoke-genelab-v0.3.1 KG |
 | `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, `streamable-http`, or `http` |
 | `MCP_HOST` | `127.0.0.1` | HTTP listener host (use `0.0.0.0` for Docker) |
 | `MCP_PORT` | `8000` | HTTP listener port |
+| `MCP_PATH_PREFIX` | *(empty)* | Public path prefix when a load balancer publishes the service under one, e.g. `/kg` → `POST /kg/mcp`, `GET /kg/healthz`, `/kg/readyz`, `/kg/metrics` |
+| `MCP_SESSION_POLICY` | `strict` (remote) / `implicit` (stdio) | `strict`: every tool except `create_session` requires a valid `session_id`; `lenient`: only state-bearing tools do; `implicit`: fixed local session |
+| `MCP_SESSION_IDLE_TTL_SECONDS` / `MCP_SESSION_MAX_AGE_SECONDS` | `3600` / `28800` | Session idle and absolute lifetimes |
+| `MCP_MAX_SESSIONS` / `MCP_MAX_PLOTS_PER_SESSION` / `MCP_MAX_TOTAL_PLOT_BYTES` | `10000` / `8` / `268435456` | Session-store bounds |
+| `MCP_SESSION_EVICTION_MIN_IDLE_SECONDS` | `300` | Minimum idle time before a session may be recycled to make room at the `MCP_MAX_SESSIONS` cap |
+| `MCP_MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum size of one `POST /mcp` body (1 MiB) |
+| `MCP_READYZ_TIMEOUT_SECONDS` / `MCP_READYZ_CACHE_SECONDS` | `4` / `2` | Budget for the `/readyz` Neo4j ping; how long the last verdict is reused |
+| `MCP_QUERY_TIMEOUT_SECONDS` / `MCP_MAX_QUERY_ROWS` | `60` / `1000` | Per-query timeout; row cap for the `query` tool |
+| `MCP_NEO4J_POOL_SIZE` / `MCP_NEO4J_ACQUISITION_TIMEOUT` | `20` / `30` | Bolt pool per process; fail-fast on saturation |
+| `MCP_USAGE_LOG` / `MCP_METRICS_EMF` / `MCP_METRICS_ENDPOINT` | `1` / `0` / `0` | Usage metrics: JSON usage log, CloudWatch EMF, `GET /metrics` |
+| `MCP_USAGE_FP_SALT` | random per process | Salt for the `client_fp` usage-log field; set it (from a secret store) so fingerprints are comparable across restarts |
+| `MCP_METRICS_NAMESPACE` / `MCP_SERVICE_NAME` | `mcp-genelab` / `mcp-genelab` | CloudWatch namespace for EMF metrics; `service` field on usage events |
+| `MCP_LOG_LEVEL` | `INFO` | Application log level |
 | `INSTRUCTIONS` | *(see source)* | System instructions for the LLM |
 
 ## Example Queries
 
-*Each link below points to a chat transcript that demonstrates how to use the mcp-genelab server to query and analyze GeneLab data hosted in the spoke-genelab-v0.3.1 Neo4j Knowledge Graph.*
+*Each link below points to a chat transcript that demonstrates how to use the mcp-genelab server to query and analyze GeneLab data hosted in the spoke-genelab-v0.3.1 Neo4j Knowledge Graph. To create a transcript of your own chat, use the prompt `Create a chat transcript`; the transcript can then be downloaded in .md or .pdf format.*
 
 ### Knowledge Graph Overview & Class Diagram 
 
@@ -316,11 +377,15 @@ The MCP server is then accessible at `http://localhost:8000/mcp/`.
 
 >*Note: To perform this example query, you will need to add the NSF OKN MCP server to your MCP client by following the instructions at [https://okn.us/mcp](https://okn.us/mcp).* 
 
+### Demos
+
+[Recorded demo sessions and transcripts](https://github.com/sbl-sdsc/mcp-genelab/tree/main/docs/examples/demos)
+
 ---
 
 ## MCP Tools Reference
 
-The server exposes **22 tools** plus a `plot://{filename}` resource template. Tools are listed below grouped by category. The specialist tools should be preferred over the generic `query` tool — server.py's `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
+The server exposes **24 tools** (22 analysis/utility tools plus `create_session` / `end_session`) and a `plot://{session_id}/{filename}` resource template. On the hosted endpoint every tool except `create_session` takes a `session_id` argument (see [docs/api.md](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/api.md#sessions-public-endpoint)). Tools are listed below grouped by category. The specialist tools should be preferred over the generic `query` tool — server.py's `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
 
 ### Schema & metadata
 
@@ -367,16 +432,18 @@ The server exposes **22 tools** plus a `plot://{filename}` resource template. To
 |------|-------------|
 | `create_volcano_plot` | Generate a volcano plot of differential expression / methylation / abundance results; PNG returned inline and registered for resource fetch |
 | `create_venn_diagram` | Create a Venn diagram comparing DEGs / DMRs / DA organisms across 2 or 3 assays (also supports the `expression_methylation` 2×2 grid variant); PNG returned inline and registered for resource fetch |
-| `fetch_plot` | Re-fetch the canonical PNG bytes of a previously generated plot from the in-memory registry (last 8 plots, FIFO eviction). Returns the bytes as an `EmbeddedResource` so clients can render them inline. Safe to call repeatedly — no Cypher, no matplotlib, no re-render |
+| `fetch_plot` | Re-fetch the canonical PNG bytes of a plot previously generated in the same session from the in-memory registry (last 8 plots per session, FIFO eviction). Returns the bytes as an `EmbeddedResource` so clients can render them inline. Safe to call repeatedly — no Cypher, no matplotlib, no re-render |
 | `get_save_script` | Return a markdown block with multiple save options for a previously generated plot: right-click save, ask-LLM-client-to-save, or fetch via the `plot://` resource URI |
-| `plot://{filename}` (resource) | MCP resource template — clients fetch PNG bytes via `resources/read` on `plot://<suggested_filename>`. Decoupled from the tool response that generated the plot, so a failed fetch can be retried without re-running the analysis |
+| `plot://{session_id}/{filename}` (resource) | MCP resource template — clients fetch PNG bytes via `resources/read` on `plot://<session_id>/<suggested_filename>`. Session-scoped so one user's plot is never addressable from another session; decoupled from the tool response that generated the plot, so a failed fetch can be retried without re-running the analysis |
 
-### Output paths
+### Sessions and output paths
 
 | Tool | Description |
 |------|-------------|
-| `set_output_directory` | Set the user-facing directory where plots and CSV files should be saved |
-| `get_output_directory` | Return the currently configured output directory |
+| `create_session` | Start a session and obtain the `session_id` that every other tool requires on the hosted endpoint (call first; call again if a tool reports the session unknown/expired) |
+| `end_session` | End a session immediately, discarding its output directory and plots |
+| `set_output_directory` | Set the user-facing directory where plots and CSV files should be saved (per session) |
+| `get_output_directory` | Return the currently configured output directory (per session) |
 
 ### Mermaid & transcript utilities
 
@@ -391,22 +458,26 @@ All Neo4j sessions are opened with `default_access_mode=READ_ACCESS`, which is e
 
 As a second layer of defense, the `query` tool includes a regex-based write filter (`_is_write_query()`) that catches the Cypher write keywords `MERGE`, `CREATE`, `SET`, `DELETE`, `REMOVE`, `ADD`, and `DROP` (case-insensitive) before the query is sent to Neo4j. All queries also use `session.execute_read()` for transaction-level read enforcement. The two layers — server-side regex + Bolt-level READ_ACCESS — protect the knowledge graph from modification even if one layer is bypassed.
 
+The `query` tool additionally rejects read-only-but-dangerous procedures that `READ_ACCESS` does not block (`_is_forbidden_query()`): `LOAD CSV`, `apoc.load.*`, `apoc.export.*`, `apoc.trigger/periodic/refactor/create/merge/cypher/systemdb.*`, `dbms.*`, and `db.create*` / `db.drop*` / full-text index creation. `apoc.meta.*` and `apoc.help` remain allowed for the schema tools. Every query runs with a server-side timeout (`MCP_QUERY_TIMEOUT_SECONDS`, 60 s) and the `query` tool caps results at `MCP_MAX_QUERY_ROWS` (1,000) rows; error messages never echo the submitted Cypher or raw driver exceptions. On the hosted endpoint, Neo4j credentials are injected at runtime (the image contains none, and remote transports refuse to start without them), per-user state is isolated by session (see `MCP_SESSION_POLICY`), and the usage log records only salted digests — never raw session ids or IP addresses. See [docs/deployment.md](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/deployment.md) for the full hardening checklist.
+
 ---
 
 ## Development
 
 [Instructions for local development](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/development.md)
 
+Release history: [CHANGELOG.md](https://github.com/sbl-sdsc/mcp-genelab/blob/main/CHANGELOG.md)
+
 ## Testing
 
-The project ships a pytest suite (95 tests across 8 files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), and the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees).
+The project ships a pytest suite (201 tests across 11 test files) that runs offline — no Neo4j connection, no network, no MCP transport. It guards against regressions in tool registration, annotation completeness, routing-policy language in tool docstrings, Cypher invariants (read-only enforcement, conditional `LIMIT`, lnfc null-safety, MethylationRegion filter propagation, pooled `IN $assay_ids` clause for cross-assay queries), the plot resource layer (`plot://` URI registration, `fetch_plot` round-trips, save-instruction size guarantees), per-session isolation (two sessions can never see each other's output directory or plots; missing/unknown/expired session errors; TTL and memory bounds), the `/healthz` / `/readyz` load-balancer routes, and the usage-metrics pipeline.
 
 ```bash
 pip install -r mcp-genelab-tests/requirements-test.txt
 pytest
 ```
 
-The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHub Actions workflow at `.github/workflows/test.yml` runs the suite on Python 3.10 through 3.13 for every push and pull request. See `mcp-genelab-tests/tests/README.md` for the per-file breakdown and instructions on adding tests for new tools.
+The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHub Actions workflow at `mcp-genelab-tests/.github/workflows/test.yml` runs the suite on Python 3.10 through 3.13 for every push and pull request. See `mcp-genelab-tests/tests/README.md` for the per-file breakdown and instructions on adding tests for new tools.
 
 ## Building and Publishing (maintainers only)
 
@@ -430,8 +501,11 @@ The suite runs in roughly 10 seconds and is safe to run on every commit. A GitHu
 - For a local Neo4j Desktop instance, ensure the `spoke-genelab` instance is started and the `spoke-genelab-v0.3.1` database has finished loading
 - Check that `NEO4J_DATABASE` is set to `spoke-genelab-v0.3.1` and matches the database name you imported
 
-**Write operation rejected:**
-- This is expected behavior. All sessions use READ_ACCESS mode. Write operations (CREATE, MERGE, SET, DELETE) are blocked at the Bolt protocol level.
+**Query rejected ("This query was rejected. Only read-only graph queries are permitted…"):**
+- This is expected behavior. The `query` tool refuses write operations (CREATE, MERGE, SET, DELETE, REMOVE, ADD, DROP) and procedures that perform network I/O, bulk export, or database administration (LOAD CSV, `apoc.load.*`, `apoc.export.*`, `dbms.*`, …) before they reach Neo4j; anything that slips past is still blocked at the Bolt protocol level because every session uses READ_ACCESS mode.
+
+**"Error (missing session)" / "Error (unknown session)" / "Error (expired session)":**
+- On the hosted endpoint every tool except `create_session` requires a valid `session_id`. Ask the assistant to call `create_session` and retry; sessions expire after 60 minutes idle or 8 hours total, and are lost when the server restarts.
 
 **Performance issues:**
 - Complex Cypher queries may take time to execute

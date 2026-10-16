@@ -271,8 +271,8 @@ def test_query_tool_blocks_writes(driver, mcp_server):
     text = call_tool_sync(
         mcp_server, "query", {"query": "CREATE (n:Foo) RETURN n"}
     )
-    assert "Error" in text
-    assert "Only read" in text
+    assert "rejected" in text.lower()
+    assert "read-only" in text.lower()
 
 
 # --- select_assays --------------------------------------------------------

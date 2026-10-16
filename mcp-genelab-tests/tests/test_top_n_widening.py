@@ -29,7 +29,7 @@ TOOLS_WITH_OPTIONAL_TOP_N = [
 
 def _top_n_schema(tools_list, name: str) -> dict:
     t = next(x for x in tools_list if x.name == name)
-    return t.inputSchema["properties"]["top_n"]
+    return t.input_schema["properties"]["top_n"]
 
 
 def _accepts_null(schema: dict) -> bool:

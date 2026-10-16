@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         # 3.10 is the floor (uses str | None in some type hints). 3.12 is
-        # what most current dev environments and the AgentCore runtime use.
+        # what most current dev environments and the Fargate image use.
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:

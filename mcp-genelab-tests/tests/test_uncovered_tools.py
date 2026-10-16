@@ -38,7 +38,7 @@ import json
 
 import pytest
 
-from conftest import call_tool_sync
+from conftest import call_tool_sync, _content_of
 
 
 # ===========================================================================
@@ -147,8 +147,8 @@ def test_get_relationship_metadata_falls_back_when_empty(driver, mcp_server):
 def test_set_then_get_output_directory_roundtrip(mcp_server, server_module):
     """set_output_directory stores the path; get_output_directory reads it back.
 
-    The path lives in module-level state, so we reset it afterward to avoid
-    leaking into other tests."""
+    The path lives in per-session state (the autouse local_session fixture
+    binds a fresh local session for every test)."""
     server_module._set_user_output_dir(None)  # clean slate
     try:
         set_text = call_tool_sync(
@@ -215,7 +215,7 @@ def _image_blocks(mcp_server, name, args):
     import asyncio
     from conftest import text_from
     result = asyncio.run(mcp_server.call_tool(name, args))
-    content = result[0] if isinstance(result, tuple) else result
+    content = _content_of(result)
     has_image = any(
         getattr(c, "type", None) == "image" or c.__class__.__name__ == "ImageContent"
         for c in content
@@ -226,7 +226,7 @@ def _image_blocks(mcp_server, name, args):
 def test_create_volcano_plot_returns_image_and_registers(driver, mcp_server, server_module):
     """create_volcano_plot must render a PNG (returned as an image block) and
     register it in the plot registry so fetch_plot / get_save_script can find it."""
-    server_module._LAST_PLOTS.clear()
+    # registry is per-session; the autouse local_session fixture resets it
     driver.set_route(_volcano_expression_route())
 
     text, has_image = _image_blocks(
@@ -236,14 +236,14 @@ def test_create_volcano_plot_returns_image_and_registers(driver, mcp_server, ser
     assert has_image, "volcano plot should return an inline image content block"
     # A plot was registered for later save-script retrieval.
     assert server_module._list_registered_plots(), (
-        "expected the volcano plot to be registered in _LAST_PLOTS"
+        "expected the volcano plot to be registered in the session registry"
     )
 
 
 def test_create_volcano_plot_handles_no_data(driver, mcp_server, server_module):
     """With no matching rows, the tool returns an informative text message and
     does not crash trying to draw an empty figure."""
-    server_module._LAST_PLOTS.clear()
+    # registry is per-session; the autouse local_session fixture resets it
     driver.set_route(lambda q, p: [])  # nothing matches
 
     text = call_tool_sync(
@@ -293,7 +293,7 @@ def _venn_two_assay_route():
 def test_create_venn_diagram_returns_image(driver, mcp_server, server_module):
     """create_venn_diagram must render a 2-way comparison as an image and
     register it for save-script retrieval."""
-    server_module._LAST_PLOTS.clear()
+    # registry is per-session; the autouse local_session fixture resets it
     driver.set_route(_venn_two_assay_route())
 
     text, has_image = _image_blocks(
@@ -306,7 +306,7 @@ def test_create_venn_diagram_returns_image(driver, mcp_server, server_module):
     assert has_image or text, "venn tool must return either an image or a text message"
     if has_image:
         assert server_module._list_registered_plots(), (
-            "a rendered Venn diagram should be registered in _LAST_PLOTS"
+            "a rendered Venn diagram should be registered in the session registry"
         )
 
 
@@ -315,7 +315,7 @@ def test_get_save_script_lists_and_resolves(mcp_server, server_module):
     filename it returns the detailed save-options block referencing the
     plot:// resource and fetch_plot."""
     # Seed the registry directly so this test doesn't depend on matplotlib.
-    server_module._LAST_PLOTS.clear()
+    # registry is per-session; the autouse local_session fixture resets it
     server_module._register_plot("demo_plot.png", b"\x89PNG\r\n\x1a\n" + b"0" * 100,
                                  "/Users/jane/Downloads/demo_plot.png")
     try:
@@ -324,16 +324,16 @@ def test_get_save_script_lists_and_resolves(mcp_server, server_module):
 
         detail = call_tool_sync(mcp_server, "get_save_script", {"filename": "demo_plot.png"})
         assert "demo_plot.png" in detail
-        assert "plot://demo_plot.png" in detail
+        assert "plot://local/demo_plot.png" in detail
         assert "fetch_plot" in detail
     finally:
-        server_module._LAST_PLOTS.clear()
+        pass  # registry is per-session; the autouse local_session fixture resets it
 
 
 def test_get_save_script_unknown_filename(mcp_server, server_module):
     """Requesting a save script for a plot that isn't in the registry returns a
     helpful 'not in the registry' message rather than crashing."""
-    server_module._LAST_PLOTS.clear()
+    # registry is per-session; the autouse local_session fixture resets it
     text = call_tool_sync(mcp_server, "get_save_script", {"filename": "ghost.png"})
     assert "ghost.png" in text
     assert "registry" in text.lower()

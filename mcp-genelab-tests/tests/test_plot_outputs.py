@@ -22,6 +22,8 @@ import re
 
 import pytest
 
+from conftest import _content_of
+
 
 # --- Save-instruction invariants ----------------------------------------
 
@@ -94,14 +96,20 @@ def test_make_save_instructions_does_not_embed_base64(server_module):
 
 def test_make_save_instructions_references_plot_resource_uri(server_module):
     """The save instructions must point the user/client at the
-    plot://<filename> resource URI as the canonical retrieval path."""
+    plot://<session_id>/<filename> resource URI as the canonical retrieval
+    path. The session id is part of the URI so one session's plot is never
+    addressable from another (shared-process deployment)."""
     result = server_module._make_save_instructions(
         user_facing_path="/tmp/venn.png",
         suggested_filename="venn_OSD-244.png",
         png_size_bytes=80_000,
     )
-    assert "plot://venn_OSD-244.png" in result, (
-        "Save instructions must reference the canonical plot:// resource URI."
+    assert "plot://local/venn_OSD-244.png" in result, (
+        "Save instructions must reference the canonical session-scoped "
+        "plot:// resource URI."
+    )
+    assert "plot://venn_OSD-244.png" not in result, (
+        "Legacy un-scoped plot://<filename> URI must no longer be emitted."
     )
 
 
@@ -123,34 +131,35 @@ def test_make_save_instructions_references_fetch_plot_tool(server_module):
 
 def test_plot_resource_template_is_registered(mcp_server):
     """The plot:// URI template must be registered as a resource template
-    that MCP clients can discover via resources/templates/list."""
+    that MCP clients can discover via resources/templates/list, and it must
+    be session-scoped."""
     templates = asyncio.run(mcp_server.list_resource_templates())
     plot_templates = [
         t for t in templates
-        if t.uriTemplate == "plot://{filename}"
+        if t.uri_template == "plot://{session_id}/{filename}"
     ]
     assert plot_templates, (
-        f"plot://{{filename}} resource template must be registered. "
-        f"Got templates: {[t.uriTemplate for t in templates]}"
+        f"plot://{{session_id}}/{{filename}} resource template must be registered. "
+        f"Got templates: {[t.uri_template for t in templates]}"
     )
     t = plot_templates[0]
-    assert t.mimeType == "image/png", (
+    assert t.mime_type == "image/png", (
         f"plot:// resource template must declare mimeType=image/png; "
-        f"got {t.mimeType!r}."
+        f"got {t.mime_type!r}."
     )
 
 
 def test_plot_resource_fetches_registered_png(mcp_server, server_module):
-    """Registering a plot in _LAST_PLOTS must make it fetchable via the
-    plot:// resource. This is the contract that lets fetch_plot and
+    """Registering a plot in the session's registry must make it fetchable
+    via the plot:// resource. This is the contract that lets fetch_plot and
     resources/read deliver canonical bytes without re-rendering."""
-    # Register a synthetic PNG directly into the module-level registry.
+    # Register a synthetic PNG into the (bound) local session's registry.
     fake_png = b"\x89PNG\r\n\x1a\n" + b"abc" * 100  # 308 bytes
     filename = "test_resource_plot.png"
-    server_module._register_plot(filename, fake_png, "/tmp/test.png")
+    assert server_module._register_plot(filename, fake_png, "/tmp/test.png")
 
     try:
-        content = asyncio.run(mcp_server.read_resource(f"plot://{filename}"))
+        content = asyncio.run(mcp_server.read_resource(f"plot://local/{filename}"))
         # FastMCP returns a list of ReadResourceContents
         assert content, "read_resource returned no content"
 
@@ -169,21 +178,18 @@ def test_plot_resource_fetches_registered_png(mcp_server, server_module):
             "PNG byte-for-byte."
         )
     finally:
-        # Clean up the registry so other tests aren't affected.
-        if filename in server_module._LAST_PLOTS:
-            del server_module._LAST_PLOTS[filename]
+        # The autouse local_session fixture wipes the store after each test.
+        pass
 
 
 def test_plot_resource_raises_for_unknown_filename(mcp_server, server_module):
     """Fetching a plot that's not in the registry must produce a clear
     error rather than silently returning empty bytes."""
-    # Make sure the registry doesn't already have this name.
-    if "nonexistent_plot.png" in server_module._LAST_PLOTS:
-        del server_module._LAST_PLOTS["nonexistent_plot.png"]
+    assert "nonexistent_plot.png" not in server_module._list_registered_plots()
 
     with pytest.raises(Exception) as exc_info:
         asyncio.run(mcp_server.read_resource(
-            "plot://nonexistent_plot.png"
+            "plot://local/nonexistent_plot.png"
         ))
     # The error message should name the missing file so a maintainer
     # debugging a failed fetch can immediately see what went wrong.
@@ -203,13 +209,13 @@ def test_fetch_plot_returns_embedded_resource_for_registered_png(
     so clients can render them inline using the resource UI."""
     fake_png = b"\x89PNG\r\n\x1a\n" + b"xyz" * 50  # 158 bytes
     filename = "test_fetch_plot.png"
-    server_module._register_plot(filename, fake_png, "/tmp/fp.png")
+    assert server_module._register_plot(filename, fake_png, "/tmp/fp.png")
 
     try:
         result = asyncio.run(
             mcp_server.call_tool("fetch_plot", {"filename": filename})
         )
-        content = result[0] if isinstance(result, tuple) else result
+        content = _content_of(result)
 
         # Look for an EmbeddedResource carrying the bytes.
         from mcp import types as mcp_types
@@ -227,14 +233,13 @@ def test_fetch_plot_returns_embedded_resource_for_registered_png(
         assert retrieved == fake_png, (
             "Bytes returned via fetch_plot must match the registered PNG."
         )
-        # The URI should also be the canonical plot:// URI.
-        assert str(embedded[0].resource.uri) == f"plot://{filename}", (
-            f"EmbeddedResource URI should be plot://{filename}; "
+        # The URI should also be the canonical session-scoped plot:// URI.
+        assert str(embedded[0].resource.uri) == f"plot://local/{filename}", (
+            f"EmbeddedResource URI should be plot://local/{filename}; "
             f"got {embedded[0].resource.uri!r}"
         )
     finally:
-        if filename in server_module._LAST_PLOTS:
-            del server_module._LAST_PLOTS[filename]
+        pass  # autouse local_session fixture cleans up
 
 
 def test_fetch_plot_returns_helpful_error_for_unknown_filename(
@@ -243,13 +248,12 @@ def test_fetch_plot_returns_helpful_error_for_unknown_filename(
     """fetch_plot must produce a helpful error message when called for a
     plot not in the registry, naming the missing file and listing what
     IS available."""
-    if "ghost_plot.png" in server_module._LAST_PLOTS:
-        del server_module._LAST_PLOTS["ghost_plot.png"]
+    assert "ghost_plot.png" not in server_module._list_registered_plots()
 
     result = asyncio.run(
         mcp_server.call_tool("fetch_plot", {"filename": "ghost_plot.png"})
     )
-    content = result[0] if isinstance(result, tuple) else result
+    content = _content_of(result)
     text = "\n".join(c.text for c in content if hasattr(c, "text"))
     assert "ghost_plot.png" in text, (
         "fetch_plot error must name the missing filename."

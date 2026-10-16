@@ -2,7 +2,7 @@
 
 ```bash
 # Increment version number (major|minor|patch)
-uv version --bump minor
+uv version --bump minor   # or: uv version 1.0.0 to set an explicit version
 
 # Remove distributions for previous versions
 rm -rf dist
