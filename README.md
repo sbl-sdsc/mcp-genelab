@@ -22,7 +22,7 @@ This server is part of the NSF-funded [Proto-OKN Project](https://www.proto-okn.
   - [Infrastructure](https://github.com/sbl-sdsc/mcp-genelab/tree/main#infrastructure)
 - [Prerequisites](https://github.com/sbl-sdsc/mcp-genelab/tree/main#prerequisites)
 - [Quick Start](https://github.com/sbl-sdsc/mcp-genelab/tree/main#quick-start)
-  - [Option A: Connect to the Remote mcp-genelab Server (coming soon)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon)
+  - [Option A: Connect to the Remote mcp-genelab Server](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server)
     - [Claude (Desktop or claude.ai)](https://github.com/sbl-sdsc/mcp-genelab/tree/main#claude-desktop-or-claudeai)
     - [ChatGPT](https://github.com/sbl-sdsc/mcp-genelab/tree/main#chatgpt)
     - [VS Code with GitHub Copilot](https://github.com/sbl-sdsc/mcp-genelab/tree/main#vs-code-with-github-copilot)
@@ -114,11 +114,11 @@ The SPOKE-GeneLab KG v0.3.1 contains the following node and relationship types:
 ### Infrastructure
 - **Read-Only Enforcement**: All Neo4j sessions use `READ_ACCESS` mode — write operations are rejected at the Bolt protocol level, protecting the knowledge graph from modification
 - **Multiple Transport Modes**: Supports STDIO (local), SSE, and Streamable HTTP (remote deployment)
-- **Remote Deployment**: Deploy as a web service behind a TLS reverse proxy (target: CloudFront + WAF → ALB → ECS Fargate), accessible via HTTPS URL from any MCP client. Ships `GET /healthz` / `GET /readyz` routes for load-balancer health checks and built-in usage metrics (JSON usage log, CloudWatch EMF, optional `/metrics`) — see [docs/deployment.md](docs/deployment.md)
+- **Remote Deployment**: Deploy as a web service behind a TLS reverse proxy (target: CloudFront + WAF → ALB → ECS Fargate), accessible via HTTPS URL from any MCP client. Ships `GET /healthz` / `GET /readyz` routes for load-balancer health checks and built-in usage metrics (JSON usage log, CloudWatch EMF, optional `/metrics`) — see [docs/deployment.md](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/deployment.md)
 - **Session Scoping**: The hosted server is one shared process serving many users, so per-user state (output directory, plot registry) is keyed on a `session_id` obtained from `create_session` and passed on every tool call — nothing a user does is visible to another session
 - **Docker Support**: Build and deploy as a Docker container for consistent, reproducible environments
 - **Multiple Access Methods**: Use through Claude Desktop / claude.ai, ChatGPT, VS Code with GitHub Copilot, Gemini, or any MCP-compatible client
-- **Pre-configured Setup**: Ready-to-use mcp-genelab configuration files for a local STDIO connection to the spoke-genelab-v0.3.1 KG (a remote public endpoint is coming soon)
+- **Pre-configured Setup**: Ready-to-use mcp-genelab configuration files for a local STDIO connection to the spoke-genelab-v0.3.1 KG, or connect to the public endpoint at `https://visualization.osdr.nasa.gov/kg/mcp` with no local install
 
 ## Prerequisites
 
@@ -131,7 +131,7 @@ Before using mcp-genelab, ensure you have:
   - Gemini app (personal Google Account) or Gemini CLI — connect via Connected Apps or `gemini mcp add`
   - Any MCP client that supports the STDIO or Streamable HTTP transport
 - **Connection to the spoke-genelab-v0.3.1 knowledge graph** via one of the two paths below:
-  - **Remote public endpoint** (*coming soon*): Connect to a hosted mcp-genelab server over HTTPS — no local install required. See [Option A](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server-coming-soon).
+  - **Remote public endpoint**: Connect to the hosted mcp-genelab server at `https://visualization.osdr.nasa.gov/kg/mcp` over HTTPS — no local install required. See [Option A](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server).
   - **Local install with STDIO**: Run mcp-genelab on your own machine against a local Neo4j instance holding the spoke-genelab-v0.3.1 KG. See [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio).
 
 For the local STDIO setup you also need:
@@ -141,13 +141,17 @@ For the local STDIO setup you also need:
 
 ## Quick Start
 
-mcp-genelab can be reached two ways: by connecting to the **remote public endpoint** (coming soon) or by **running mcp-genelab locally with STDIO**. Both serve the `spoke-genelab-v0.3.1` knowledge graph.
+mcp-genelab can be reached two ways: by connecting to the **remote public endpoint** (`https://visualization.osdr.nasa.gov/kg/mcp`) or by **running mcp-genelab locally with STDIO**. Both serve the `spoke-genelab-v0.3.1` knowledge graph.
 
-### Option A: Connect to the Remote mcp-genelab Server (coming soon)
+### Option A: Connect to the Remote mcp-genelab Server
 
-> **Status: Coming soon.** A public HTTPS endpoint for mcp-genelab is being prepared. When it is live, the URL will be published here and in the [mcp-genelab repository](https://github.com/sbl-sdsc/mcp-genelab). Until then, use [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio) to run mcp-genelab locally.
+The public mcp-genelab endpoint is:
 
-Once the public endpoint is available, you will be able to connect to mcp-genelab without installing anything locally. The endpoint is a Streamable HTTP MCP server with no authentication; pick your client below.
+```
+https://visualization.osdr.nasa.gov/kg/mcp
+```
+
+It is a Streamable HTTP MCP server hosted by NASA OSDR with no authentication required, so you can connect without installing anything locally. Pick your client below. (If you would rather run against your own Neo4j instance, use [Option B](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-b-run-mcp-genelab-locally-with-stdio).)
 
 #### Claude (Desktop or claude.ai)
 
@@ -156,7 +160,7 @@ Once the public endpoint is available, you will be able to connect to mcp-genela
 3. Click **Add Custom Connector**
 4. Enter:
    - **Name**: `mcp-genelab`
-   - **MCP Server URL**: *the public mcp-genelab endpoint (coming soon)*
+   - **MCP Server URL**: `https://visualization.osdr.nasa.gov/kg/mcp`
 5. Click **Save**
 6. In the chat prompt, click the **+** button and toggle the **mcp-genelab** connector **on**
 
@@ -168,7 +172,7 @@ Documentation: [Getting started with custom connectors using remote MCP](https:/
 2. Go to [chatgpt.com/plugins](https://chatgpt.com/plugins), click **+**, then **Add custom MCP server**
 3. Enter:
    - **Name**: `mcp-genelab`
-   - **Server URL**: *the public mcp-genelab endpoint (coming soon)*
+   - **Server URL**: `https://visualization.osdr.nasa.gov/kg/mcp`
    - **Authentication**: **No authentication**
 4. Accept the risk notice (**I understand and want to continue**), then click **Create as a plugin** and **install** it
 5. In the chat prompt, type **@** and select **mcp-genelab**
@@ -178,7 +182,7 @@ Documentation: [Add custom MCP server](https://developers.openai.com/api/docs/gu
 #### VS Code with GitHub Copilot
 
 1. Open the Command Palette (Cmd+Shift+P) and run **MCP: Add Server**
-2. Choose **HTTP**, enter *the public mcp-genelab endpoint (coming soon)* as the URL and `mcp-genelab` as the server ID, and pick where to save it (workspace or global)
+2. Choose **HTTP**, enter `https://visualization.osdr.nasa.gov/kg/mcp` as the URL and `mcp-genelab` as the server ID, and pick where to save it (workspace or global)
 3. When prompted, confirm that you **trust** the server so it starts
 
 Equivalently, add this to `.vscode/mcp.json` (or your user MCP configuration):
@@ -188,7 +192,7 @@ Equivalently, add this to `.vscode/mcp.json` (or your user MCP configuration):
   "servers": {
     "mcp-genelab": {
       "type": "http",
-      "url": "<the public mcp-genelab endpoint (coming soon)>"
+      "url": "https://visualization.osdr.nasa.gov/kg/mcp"
     }
   }
 }
@@ -203,7 +207,7 @@ Documentation: [Use MCP servers in VS Code](https://code.visualstudio.com/docs/a
 **Gemini app** (web; personal Google Account):
 
 1. Go to [gemini.google.com](https://gemini.google.com), click **Settings → Connected Apps** (if you don't see it, click **Personal Intelligence** first)
-2. Under **Custom apps**, click **Add a custom app** and enter *the public mcp-genelab endpoint (coming soon)*
+2. Under **Custom apps**, click **Add a custom app** and enter `https://visualization.osdr.nasa.gov/kg/mcp`
 3. Click **Next** and follow the on-screen instructions
 4. In the chat prompt, type **@** and select the custom app
 
@@ -212,10 +216,10 @@ Documentation: [Connect & manage custom apps for Gemini Apps](https://support.go
 **Gemini CLI** (any Google account):
 
 ```bash
-gemini mcp add --transport http mcp-genelab <the public mcp-genelab endpoint (coming soon)>
+gemini mcp add --transport http mcp-genelab https://visualization.osdr.nasa.gov/kg/mcp
 ```
 
-or add to `~/.gemini/settings.json`: `{"mcpServers": {"mcp-genelab": {"httpUrl": "<endpoint>"}}}`, then run `/mcp` inside Gemini CLI to confirm it is connected.
+or add to `~/.gemini/settings.json`: `{"mcpServers": {"mcp-genelab": {"httpUrl": "https://visualization.osdr.nasa.gov/kg/mcp"}}}`, then run `/mcp` inside Gemini CLI to confirm it is connected.
 
 Documentation: [Gemini CLI — MCP servers](https://geminicli.com/docs/tools/mcp-server/)
 
@@ -314,7 +318,7 @@ docker run \
   mcp-genelab:latest
 ```
 
-The MCP server is then accessible at `http://localhost:8000/mcp/`, with `GET http://localhost:8000/healthz` (liveness) and `GET http://localhost:8000/readyz` (readiness — pings Neo4j) for load balancers (all under `MCP_PATH_PREFIX` if one is set, e.g. `/kg/mcp`). In any remote transport the server defaults to `MCP_SESSION_POLICY=strict`: clients must call `create_session` first and pass the returned `session_id` on every tool call (see [docs/api.md](docs/api.md#sessions-public-endpoint)).
+The MCP server is then accessible at `http://localhost:8000/mcp/`, with `GET http://localhost:8000/healthz` (liveness) and `GET http://localhost:8000/readyz` (readiness — pings Neo4j) for load balancers (all under `MCP_PATH_PREFIX` if one is set, e.g. `/kg/mcp`). In any remote transport the server defaults to `MCP_SESSION_POLICY=strict`: clients must call `create_session` first and pass the returned `session_id` on every tool call (see [docs/api.md](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/api.md#sessions-public-endpoint)).
 
 
 ### Environment Variables
@@ -381,7 +385,7 @@ The MCP server is then accessible at `http://localhost:8000/mcp/`, with `GET htt
 
 ## MCP Tools Reference
 
-The server exposes **24 tools** (22 analysis/utility tools plus `create_session` / `end_session`) and a `plot://{session_id}/{filename}` resource template. On the hosted endpoint every tool except `create_session` takes a `session_id` argument (see [docs/api.md](docs/api.md#sessions-public-endpoint)). Tools are listed below grouped by category. The specialist tools should be preferred over the generic `query` tool — server.py's `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
+The server exposes **24 tools** (22 analysis/utility tools plus `create_session` / `end_session`) and a `plot://{session_id}/{filename}` resource template. On the hosted endpoint every tool except `create_session` takes a `session_id` argument (see [docs/api.md](https://github.com/sbl-sdsc/mcp-genelab/blob/main/docs/api.md#sessions-public-endpoint)). Tools are listed below grouped by category. The specialist tools should be preferred over the generic `query` tool — server.py's `DEFAULT_INSTRUCTIONS` carries a `TOOL SELECTION POLICY` that routes natural-language requests to the right specialist.
 
 ### Schema & metadata
 

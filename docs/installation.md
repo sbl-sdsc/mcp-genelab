@@ -1,6 +1,6 @@
 ## Installation
 
-These instructions cover installing and running **mcp-genelab** locally with the STDIO transport against the **spoke-genelab-v0.3.1** knowledge graph. (A remote public mcp-genelab endpoint is *coming soon*; when available it will be documented in the [README](../README.md).)
+These instructions cover installing and running **mcp-genelab** locally with the STDIO transport against the **spoke-genelab-v0.3.1** knowledge graph. (To use the hosted public endpoint instead — `https://visualization.osdr.nasa.gov/kg/mcp`, no local install required — see [Option A in the README](https://github.com/sbl-sdsc/mcp-genelab/tree/main#option-a-connect-to-the-remote-mcp-genelab-server).)
 
 ### Set up the spoke-genelab-v0.3.1 knowledge graph
 
@@ -64,7 +64,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 1. **Download and Install Claude Desktop**
 
-   Visit [https://claude.ai/download](https://claude.ai/download) and install Claude Desktop for your operating system.
+   Visit [https://claude.com/download](https://claude.com/download) and install Claude Desktop for your operating system.
 
    > **Requirements**: Claude Pro or Max subscription is required for MCP server functionality.
 
